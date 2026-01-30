@@ -33,6 +33,7 @@ type CaptureWorker struct {
 	camera  Camera
 	running atomic.Bool
 	stopCh  chan struct{}
+	wg      sync.WaitGroup // Tracks capture goroutine for clean shutdown
 
 	// Frame output - supports both channel and buffer modes
 	frameCh     chan<- image.Image // Legacy channel mode
@@ -258,11 +259,15 @@ func (cw *CaptureWorker) Start() error {
 	}
 
 	cw.running.Store(true)
-	go cw.captureLoop()
+	cw.wg.Add(1)
+	go func() {
+		defer cw.wg.Done()
+		cw.captureLoop()
+	}()
 	return nil
 }
 
-// Stop stops capture worker
+// Stop stops capture worker and waits for goroutine to exit
 func (cw *CaptureWorker) Stop() {
 	if !cw.running.Load() {
 		return
@@ -278,11 +283,46 @@ func (cw *CaptureWorker) Stop() {
 		close(cw.stopCh)
 	}
 
+	// Kill FFmpeg immediately to unblock any reads
 	cw.ffmpegMu.Lock()
 	if cw.ffmpegCmd != nil && cw.ffmpegCmd.Process != nil {
 		cw.ffmpegCmd.Process.Kill()
+		cw.ffmpegCmd.Wait() // Reap zombie process
 	}
 	cw.ffmpegMu.Unlock()
+
+	// Wait for capture goroutine to fully exit (with timeout)
+	done := make(chan struct{})
+	go func() {
+		cw.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Goroutine exited cleanly
+	case <-time.After(2 * time.Second):
+		log.Printf("[Capture] %s: Warning - goroutine did not exit within 2s", cw.camera.DeviceID)
+	}
+}
+
+// Restart stops the worker and starts it again with a fresh stopCh
+// Used for hot-plug recovery without recreating the entire manager
+func (cw *CaptureWorker) Restart() error {
+	log.Printf("[Capture] %s: Restarting worker...", cw.camera.DeviceID)
+
+	// Stop waits for goroutine to fully exit
+	cw.Stop()
+
+	// Reset stopCh (old one is closed)
+	cw.stopCh = make(chan struct{})
+
+	// Reset stats
+	cw.frameCount.Store(0)
+	cw.errorCount.Store(0)
+	cw.skippedFrames.Store(0)
+
+	// Start again
+	return cw.Start()
 }
 
 // GetStats returns capture statistics

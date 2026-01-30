@@ -209,6 +209,46 @@ func (m *Manager) GetWorker(cameraID string) *CaptureWorker {
 	return nil
 }
 
+// RestartCamera restarts only the specified camera's capture worker
+// Other cameras continue running uninterrupted
+func (m *Manager) RestartCamera(cameraID string) error {
+	m.mutex.RLock()
+	var worker *CaptureWorker
+	for i, cam := range m.cameras {
+		if cam.DeviceID == cameraID && i < len(m.workers) {
+			worker = m.workers[i]
+			break
+		}
+	}
+	m.mutex.RUnlock()
+
+	if worker == nil {
+		return fmt.Errorf("camera %s not found", cameraID)
+	}
+
+	log.Printf("[Manager] Restarting camera %s (other cameras unaffected)", cameraID)
+	return worker.Restart()
+}
+
+// RestartCameraByIndex restarts only the camera at the specified index
+// Other cameras continue running uninterrupted
+func (m *Manager) RestartCameraByIndex(index int) error {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	if index < 0 || index >= len(m.workers) {
+		return fmt.Errorf("camera index %d out of range", index)
+	}
+
+	worker := m.workers[index]
+	if worker == nil {
+		return fmt.Errorf("camera at index %d has no worker", index)
+	}
+
+	log.Printf("[Manager] Restarting camera at index %d (other cameras unaffected)", index)
+	return worker.Restart()
+}
+
 // Errors
 var (
 	ErrManagerNotInitialized = fmt.Errorf("camera manager not initialized")

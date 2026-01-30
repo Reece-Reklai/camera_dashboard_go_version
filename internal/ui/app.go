@@ -54,9 +54,10 @@ type App struct {
 	grid              *fyne.Container
 
 	// Hot-plug detection
-	hotplugStopCh    chan struct{}
-	reinitInProgress bool // Prevents concurrent reinitializations
-	reinitLock       sync.Mutex
+	hotplugStopCh      chan struct{}
+	reinitInProgress   bool // Prevents concurrent reinitializations
+	reinitLock         sync.Mutex
+	lastDisconnectTime [3]time.Time // Per-camera debounce tracking
 
 	// Performance management
 	perfController *perf.AdaptiveController
@@ -880,7 +881,10 @@ func (a *App) checkCameraChanges() {
 		wasConnected := a.cameraStatus[i]
 
 		if wasConnected && !deviceExists {
-			// Camera disconnected
+			// Camera disconnected - record time for debouncing
+			a.reinitLock.Lock()
+			a.lastDisconnectTime[i] = time.Now()
+			a.reinitLock.Unlock()
 			log.Printf("[Hotplug] Camera %d (%s) disconnected", i, cam.DevicePath)
 			a.updateCameraStatus(i, false)
 		} else if !wasConnected && deviceExists {
@@ -944,20 +948,31 @@ func (a *App) checkForNewCameras() {
 }
 
 // isUSBCaptureDevice checks if a device path is a USB video capture device
+// Uses sysfs instead of v4l2-ctl to avoid conflicts with active FFmpeg capture
 func (a *App) isUSBCaptureDevice(devPath string) bool {
-	// Quick check using v4l2-ctl --info
-	cmd := exec.Command("v4l2-ctl", "--device="+devPath, "--info")
-	output, err := cmd.Output()
+	// Extract video number from path (e.g., /dev/video0 -> 0)
+	var videoNum int
+	_, err := fmt.Sscanf(devPath, "/dev/video%d", &videoNum)
 	if err != nil {
 		return false
 	}
 
-	outputStr := string(output)
-	// Must support video capture and be a USB device
-	isCapture := strings.Contains(outputStr, "Video Capture")
-	isUSB := strings.Contains(strings.ToLower(outputStr), "usb")
+	// Check sysfs for device type - USB capture devices have specific characteristics
+	// USB cameras typically create even-numbered video devices (video0, video2, video4)
+	// Odd numbers are usually metadata devices
+	if videoNum%2 != 0 {
+		return false // Skip odd-numbered devices (metadata)
+	}
 
-	return isCapture && isUSB
+	// Check if it's a capture device by looking at sysfs
+	sysfsPath := fmt.Sprintf("/sys/class/video4linux/video%d/device/modalias", videoNum)
+	data, err := os.ReadFile(sysfsPath)
+	if err != nil {
+		return false
+	}
+
+	// USB devices have modalias starting with "usb:"
+	return strings.HasPrefix(string(data), "usb:")
 }
 
 // handleNewCameraDevice handles a newly detected camera device
@@ -1029,8 +1044,18 @@ func (a *App) handleNewCameraDevice(devPath string) {
 }
 
 // handleCameraReconnect handles a camera that was disconnected and is now reconnected
+// Uses per-camera restart to avoid disrupting other cameras
 func (a *App) handleCameraReconnect(camIndex int) {
+	// Debounce: ignore reconnects within 3 seconds of disconnect
 	a.reinitLock.Lock()
+	timeSinceDisconnect := time.Since(a.lastDisconnectTime[camIndex])
+	if timeSinceDisconnect < 3*time.Second {
+		a.reinitLock.Unlock()
+		log.Printf("[Hotplug] Camera %d: Ignoring reconnect (%.1fs since disconnect, need 3s debounce)",
+			camIndex, timeSinceDisconnect.Seconds())
+		return
+	}
+
 	if a.reinitInProgress {
 		a.reinitLock.Unlock()
 		log.Printf("[Hotplug] Reinit already in progress, skipping reconnect for camera %d", camIndex)
@@ -1039,7 +1064,7 @@ func (a *App) handleCameraReconnect(camIndex int) {
 	a.reinitInProgress = true
 	a.reinitLock.Unlock()
 
-	log.Printf("[Hotplug] Attempting to restart camera %d...", camIndex)
+	log.Printf("[Hotplug] Camera %d: Attempting per-camera restart (other cameras unaffected)...", camIndex)
 
 	go func() {
 		defer func() {
@@ -1048,35 +1073,20 @@ func (a *App) handleCameraReconnect(camIndex int) {
 			a.reinitLock.Unlock()
 		}()
 
-		// Let the device settle
+		// Let the device settle after reconnection
 		time.Sleep(1500 * time.Millisecond)
 
-		// Stop existing manager and wait for cleanup
+		// Restart only this camera's worker
 		if a.manager != nil {
-			a.manager.Stop()
-			time.Sleep(500 * time.Millisecond) // Give workers time to exit
-		}
-
-		// Use buffer mode for decoupled capture/render
-		a.manager = camera.NewManagerWithBuffers()
-		if err := a.manager.Initialize(); err != nil {
-			log.Printf("[Hotplug] Failed to reinitialize manager: %v", err)
-			return
-		}
-		if err := a.manager.Start(); err != nil {
-			log.Printf("[Hotplug] Failed to start manager: %v", err)
-			return
-		}
-
-		a.cameras = a.manager.GetCameras()
-		log.Printf("[Hotplug] Reinitialized with %d cameras", len(a.cameras))
-
-		// Update status for all detected cameras
-		for i := range a.cameras {
-			if i < 3 {
-				a.updateCameraStatus(i, true)
+			if err := a.manager.RestartCameraByIndex(camIndex); err != nil {
+				log.Printf("[Hotplug] Camera %d: Failed to restart: %v", camIndex, err)
+				return
 			}
 		}
+
+		// Mark camera as connected
+		a.updateCameraStatus(camIndex, true)
+		log.Printf("[Hotplug] Camera %d: Successfully restarted", camIndex)
 	}()
 }
 

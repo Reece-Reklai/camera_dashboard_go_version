@@ -7,7 +7,7 @@ A high-performance multi-camera monitoring system for Raspberry Pi, designed for
 - **Multi-Camera Support** - Up to 3 USB cameras in a 2x2 grid layout
 - **Real-time Video** - 640x480 @ 15 FPS, optimized for vehicle monitoring
 - **Touch Interface** - Tap for fullscreen, long-press to swap camera positions
-- **Hot-plug Detection** - Cameras auto-detect when connected/disconnected
+- **Hot-plug Detection** - Per-camera restart when disconnected/reconnected (other cameras unaffected)
 - **Low Power** - Optimized for battery-powered operation (~100% CPU for 2 cameras)
 - **Single Binary** - No Python, no runtime dependencies
 
@@ -141,5 +141,6 @@ See [LEARN.md](LEARN.md) for a comprehensive technical deep-dive into:
 - Concurrency patterns (goroutines, channels, atomics)
 - Lock-free data structures (FrameBuffer)
 - FFmpeg integration and MJPEG streaming
+- Hot-plug detection and per-camera restart
 - GUI architecture with Fyne
 - Performance optimization techniques

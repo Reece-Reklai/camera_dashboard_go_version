@@ -16,9 +16,10 @@ This document explains the technical concepts, patterns, and decisions in this c
 8. [GUI Architecture with Fyne](#8-gui-architecture-with-fyne)
 9. [Signal Handling and Graceful Shutdown](#9-signal-handling-and-graceful-shutdown)
 10. [Zombie Process Prevention](#10-zombie-process-prevention)
-11. [Performance Optimization](#11-performance-optimization)
-12. [Error Handling Patterns](#12-error-handling-patterns)
-13. [Key Go Concepts Used](#13-key-go-concepts-used)
+11. [Hot-Plug Detection and Per-Camera Restart](#11-hot-plug-detection-and-per-camera-restart)
+12. [Performance Optimization](#12-performance-optimization)
+13. [Error Handling Patterns](#13-error-handling-patterns)
+14. [Key Go Concepts Used](#14-key-go-concepts-used)
 
 ---
 
@@ -629,7 +630,7 @@ When a child process (FFmpeg) exits, it becomes a **zombie** until the parent ca
 ```
 BEFORE Wait():
   PID   STATE
-  1234  Z (zombie)  ← FFmpeg exited but not reaped
+  1234  Z (zombie)  <- FFmpeg exited but not reaped
 
 AFTER Wait():
   Process entry removed from system
@@ -671,7 +672,254 @@ ps aux | awk '$8 == "Z" {count++} END {print count ? count : 0}'
 
 ---
 
-## 11. Performance Optimization
+## 11. Hot-Plug Detection and Per-Camera Restart
+
+### The Problem
+
+USB cameras can disconnect unexpectedly (loose cable, USB hub issues, power glitches). The system needs to:
+1. Detect when a camera disconnects
+2. Show a placeholder (test pattern) for the disconnected camera
+3. Automatically restart the camera when it reconnects
+4. **Not disrupt other cameras** during this process
+
+### Initial Approach (Problematic)
+
+Our first implementation restarted ALL cameras when one disconnected:
+
+```go
+// BAD: Disrupts all cameras
+func handleCameraReconnect(camIndex int) {
+    a.manager.Stop()          // Stops ALL cameras!
+    a.manager = NewManager()  // Recreates everything
+    a.manager.Initialize()    // Re-discovers all cameras
+    a.manager.Start()         // Restarts all cameras
+}
+```
+
+This caused:
+- Brief interruption on ALL camera feeds (even healthy ones)
+- USB bandwidth contention when restarting multiple cameras
+- Potential race conditions with rapid reconnects
+
+### The Solution: Per-Camera Restart
+
+We added methods to restart individual cameras without affecting others:
+
+```go
+// capture.go - Worker can restart itself
+func (cw *CaptureWorker) Restart() error {
+    cw.Stop()                           // Stop this worker only
+    cw.stopCh = make(chan struct{})     // Fresh stop channel
+    return cw.Start()                   // Start new capture loop
+}
+
+// manager.go - Manager can restart specific camera
+func (m *Manager) RestartCameraByIndex(index int) error {
+    worker := m.workers[index]
+    return worker.Restart()  // Only affects this camera
+}
+```
+
+### Proper Goroutine Cleanup with WaitGroup
+
+The tricky part is ensuring the old capture goroutine fully exits before starting a new one. We use a `sync.WaitGroup`:
+
+```go
+type CaptureWorker struct {
+    wg sync.WaitGroup  // Tracks capture goroutine
+    // ...
+}
+
+func (cw *CaptureWorker) Start() error {
+    cw.wg.Add(1)
+    go func() {
+        defer cw.wg.Done()
+        cw.captureLoop()
+    }()
+    return nil
+}
+
+func (cw *CaptureWorker) Stop() {
+    cw.running.Store(false)
+    close(cw.stopCh)
+    
+    // Kill FFmpeg to unblock reads
+    if cw.ffmpegCmd != nil {
+        cw.ffmpegCmd.Process.Kill()
+        cw.ffmpegCmd.Wait()
+    }
+    
+    // Wait for goroutine to exit (with timeout)
+    done := make(chan struct{})
+    go func() {
+        cw.wg.Wait()
+        close(done)
+    }()
+    
+    select {
+    case <-done:
+        // Clean exit
+    case <-time.After(2 * time.Second):
+        log.Printf("Warning: goroutine did not exit in time")
+    }
+}
+```
+
+### Why WaitGroup is Critical
+
+Without proper waiting, you get **two goroutines fighting** for the same camera:
+
+```
+Time     Old Goroutine              New Goroutine
+─────────────────────────────────────────────────
+T0       captureLoop() running
+T1       Stop() called
+T2       running=false, still in    
+         retry loop (10s ticker)
+T3                                  Start() called
+T4       tries FFmpeg...            tries FFmpeg...
+                                    ↑ CONFLICT!
+```
+
+With WaitGroup:
+
+```
+Time     Old Goroutine              New Goroutine
+─────────────────────────────────────────────────
+T0       captureLoop() running
+T1       Stop() called
+T2       running=false, exits
+T3       wg.Done() called
+T4       Stop() returns             
+T5                                  Start() called
+                                    ↑ Safe!
+```
+
+### Debouncing Reconnection Events
+
+USB re-enumeration can cause rapid disconnect/reconnect events. We debounce to prevent multiple restart attempts:
+
+```go
+type App struct {
+    lastDisconnectTime [3]time.Time  // Per-camera tracking
+    // ...
+}
+
+func (a *App) handleCameraReconnect(camIndex int) {
+    // Ignore reconnects within 3 seconds of disconnect
+    timeSinceDisconnect := time.Since(a.lastDisconnectTime[camIndex])
+    if timeSinceDisconnect < 3*time.Second {
+        log.Printf("Ignoring reconnect (%.1fs since disconnect)", 
+            timeSinceDisconnect.Seconds())
+        return
+    }
+    
+    // Proceed with restart...
+}
+```
+
+### Avoiding v4l2-ctl Conflicts
+
+Originally, we used `v4l2-ctl --info` to check if a device was a USB camera. But this conflicts with active FFmpeg capture:
+
+```go
+// BAD: Conflicts with FFmpeg
+func isUSBCaptureDevice(devPath string) bool {
+    cmd := exec.Command("v4l2-ctl", "--device="+devPath, "--info")
+    output, _ := cmd.Output()  // May block or fail
+    return strings.Contains(string(output), "USB")
+}
+```
+
+We switched to reading sysfs directly (no device locking):
+
+```go
+// GOOD: No conflicts
+func isUSBCaptureDevice(devPath string) bool {
+    var videoNum int
+    fmt.Sscanf(devPath, "/dev/video%d", &videoNum)
+    
+    // Read from sysfs (always available, no locking)
+    sysfsPath := fmt.Sprintf("/sys/class/video4linux/video%d/device/modalias", videoNum)
+    data, err := os.ReadFile(sysfsPath)
+    if err != nil {
+        return false
+    }
+    
+    // USB devices have modalias starting with "usb:"
+    return strings.HasPrefix(string(data), "usb:")
+}
+```
+
+### Hot-Plug Architecture
+
+```
+                    ┌─────────────────────────────────────────────────────────┐
+                    │                  Hot-Plug Detection                      │
+                    │                 (polls every 2 seconds)                  │
+                    └──────────────────────────┬──────────────────────────────┘
+                                               │
+                                               ▼
+                    ┌──────────────────────────────────────────────────────────┐
+                    │              Check each camera's device file              │
+                    │                                                           │
+                    │   for i, cam := range cameras:                           │
+                    │       exists := os.Stat(cam.DevicePath) == nil           │
+                    │       if wasConnected && !exists: DISCONNECT             │
+                    │       if !wasConnected && exists: RECONNECT              │
+                    └──────────────────────────────────────────────────────────┘
+                                               │
+                          ┌────────────────────┴────────────────────┐
+                          │                                         │
+                          ▼                                         ▼
+               ┌──────────────────────┐              ┌─────────────────────────┐
+               │     DISCONNECT       │              │       RECONNECT         │
+               │                      │              │                         │
+               │  - Record timestamp  │              │  - Check debounce (3s)  │
+               │  - Update UI status  │              │  - Per-camera restart   │
+               │  - Show test pattern │              │  - Update UI status     │
+               └──────────────────────┘              └─────────────────────────┘
+                          │                                         │
+                          │                                         ▼
+                          │                          ┌─────────────────────────┐
+                          │                          │  RestartCameraByIndex() │
+                          │                          │                         │
+                          │                          │  1. Stop worker (wait)  │
+                          │                          │  2. Reset stopCh        │
+                          │                          │  3. Start new goroutine │
+                          │                          │                         │
+                          │                          │  Other cameras:         │
+                          │                          │  UNAFFECTED             │
+                          │                          └─────────────────────────┘
+                          │                                         │
+                          └────────────────────┬────────────────────┘
+                                               │
+                                               ▼
+                    ┌──────────────────────────────────────────────────────────┐
+                    │                    Camera Grid UI                         │
+                    │                                                           │
+                    │  ┌──────────┐ ┌──────────┐     Connected cameras show    │
+                    │  │ Camera 0 │ │ Camera 1 │     live video feed            │
+                    │  │ (live)   │ │(restart) │                                │
+                    │  └──────────┘ └──────────┘     Disconnected cameras show  │
+                    │  ┌──────────┐ ┌──────────┐     test pattern + status      │
+                    │  │ Settings │ │ Camera 2 │                                │
+                    │  │          │ │ (disc.)  │                                │
+                    │  └──────────┘ └──────────┘                                │
+                    └──────────────────────────────────────────────────────────┘
+```
+
+### Key Takeaways
+
+1. **Per-camera isolation** - One camera's issues don't affect others
+2. **WaitGroup for cleanup** - Ensures old goroutines fully exit before starting new ones
+3. **Debouncing** - Prevents rapid restart cycles during USB re-enumeration
+4. **Sysfs over v4l2-ctl** - Avoids device locking conflicts
+5. **Timeout on wait** - Prevents indefinite hangs if goroutine is stuck
+
+---
+
+## 12. Performance Optimization
 
 ### CPU Optimization
 
@@ -734,7 +982,7 @@ Always use MJPEG format when available!
 
 ---
 
-## 12. Error Handling Patterns
+## 13. Error Handling Patterns
 
 ### Recover from Panics
 
@@ -787,7 +1035,7 @@ func (cw *CaptureWorker) readMJPEGFrameRaw(...) ([]byte, error) {
 
 ---
 
-## 13. Key Go Concepts Used
+## 14. Key Go Concepts Used
 
 ### Interfaces
 
