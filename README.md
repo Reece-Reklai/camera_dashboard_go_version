@@ -134,13 +134,3 @@ DISPLAY=:0 camera-dashboard  # Set explicitly
 ## License
 
 MIT License - see LICENSE.MIT
-
-## Learn More
-
-See [LEARN.md](LEARN.md) for a comprehensive technical deep-dive into:
-- Concurrency patterns (goroutines, channels, atomics)
-- Lock-free data structures (FrameBuffer)
-- FFmpeg integration and MJPEG streaming
-- Hot-plug detection and per-camera restart
-- GUI architecture with Fyne
-- Performance optimization techniques
