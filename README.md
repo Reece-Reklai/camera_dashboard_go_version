@@ -1,6 +1,6 @@
 # Camera Dashboard
 
-Opencode Driven: A high-performance multi-camera monitoring system for Raspberry Pi, designed for vehicle use (rear camera, blind spot monitoring). Built with Go and the Fyne GUI framework.
+Opencode Driven: A high-performance 3-camera setup as a monitoring system for Raspberry Pi. Built with Go and the Fyne GUI framework.
 
 ## Features
 
