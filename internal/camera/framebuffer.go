@@ -38,6 +38,7 @@ func NewFrameBuffer() *FrameBuffer {
 // Write stores a new frame (called by capture goroutine)
 // This is non-blocking and always succeeds
 func (fb *FrameBuffer) Write(frame image.Image) {
+	fb.mu.Lock()
 	// Write to current write slot
 	writeIdx := fb.writeIndex.Load()
 	fb.frames[writeIdx] = frame
@@ -45,6 +46,7 @@ func (fb *FrameBuffer) Write(frame image.Image) {
 	// Atomic swap - make written frame available for reading
 	fb.writeIndex.Store(1 - writeIdx)
 	fb.readIndex.Store(writeIdx)
+	fb.mu.Unlock()
 
 	fb.frameCount.Add(1)
 	fb.lastFrameAt.Store(time.Now().UnixNano())
@@ -53,8 +55,11 @@ func (fb *FrameBuffer) Write(frame image.Image) {
 // Read returns the latest frame (called by UI goroutine)
 // Returns nil if no frame available yet
 func (fb *FrameBuffer) Read() image.Image {
+	fb.mu.RLock()
 	readIdx := fb.readIndex.Load()
-	return fb.frames[readIdx]
+	frame := fb.frames[readIdx]
+	fb.mu.RUnlock()
+	return frame
 }
 
 // ReadIfNew returns the frame only if it's newer than lastRead
@@ -65,8 +70,10 @@ func (fb *FrameBuffer) ReadIfNew(lastRead uint64) (image.Image, uint64, bool) {
 		return nil, lastRead, false
 	}
 
+	fb.mu.RLock()
 	readIdx := fb.readIndex.Load()
 	frame := fb.frames[readIdx]
+	fb.mu.RUnlock()
 	return frame, currentCount, true
 }
 

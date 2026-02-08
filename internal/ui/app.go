@@ -2,6 +2,8 @@ package ui
 
 import (
 	"camera-dashboard-go/internal/camera"
+	"camera-dashboard-go/internal/config"
+	"camera-dashboard-go/internal/helpers"
 	"camera-dashboard-go/internal/perf"
 	"fmt"
 	"fyne.io/fyne/v2"
@@ -15,6 +17,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +29,7 @@ type App struct {
 	window  fyne.Window
 	manager *camera.Manager
 	cameras []camera.Camera
+	cfg     *config.Config
 
 	// Grid positions (4 slots: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right)
 	// Each slot can contain: -1 = settings, 0-2 = camera index
@@ -59,6 +63,15 @@ type App struct {
 	reinitLock         sync.Mutex
 	lastDisconnectTime [3]time.Time // Per-camera debounce tracking
 
+	// Stale frame detection + bounded auto-restart
+	lastFrameTime   [3]time.Time   // When each camera last produced a frame
+	restartEvents   [3][]time.Time // Sliding window of restart timestamps
+	lastRestartTime [3]time.Time   // Last restart timestamp per camera
+	restartLimitHit [3]bool        // Whether restart limit was reached
+
+	// Night mode
+	nightModeEnabled bool
+
 	// Performance management
 	perfController *perf.AdaptiveController
 }
@@ -69,7 +82,11 @@ type Highlightable interface {
 }
 
 // NewApp creates a new camera dashboard application
-func NewApp() *App {
+func NewApp(cfg *config.Config) *App {
+	if cfg == nil {
+		cfg = config.DefaultConfig()
+	}
+
 	fyneApp := app.New()
 	window := fyneApp.NewWindow("Camera Dashboard - Go")
 
@@ -79,6 +96,7 @@ func NewApp() *App {
 	a := &App{
 		fyneApp:        fyneApp,
 		window:         window,
+		cfg:            cfg,
 		swapSourceSlot: -1,
 		hotplugStopCh:  make(chan struct{}),
 	}
@@ -126,6 +144,8 @@ func (a *App) Start() {
 	go a.initializeCamerasAsync()
 	a.startCameraRefresh()
 	go a.startHotplugDetection()
+	go a.startStaleFrameDetection()
+	go a.startHealthLogging()
 	a.fyneApp.Run()
 }
 
@@ -297,6 +317,7 @@ type TappableSettings struct {
 	bg             *canvas.Rectangle
 	border         *canvas.Rectangle
 	content        *fyne.Container
+	nightModeBtn   *widget.Button
 	onTap          func()
 	onLongTap      func()
 	pressStart     time.Time
@@ -307,7 +328,7 @@ type TappableSettings struct {
 	mu             sync.Mutex
 }
 
-func NewTappableSettings(onRestart, onExit, onTap, onLongTap func()) *TappableSettings {
+func NewTappableSettings(onRestart, onExit, onNightModeToggle, onTap, onLongTap func()) *TappableSettings {
 	t := &TappableSettings{
 		bg:        canvas.NewRectangle(color.RGBA{50, 50, 55, 255}),
 		border:    canvas.NewRectangle(color.Transparent),
@@ -323,15 +344,33 @@ func NewTappableSettings(onRestart, onExit, onTap, onLongTap func()) *TappableSe
 		}
 	})
 
+	t.nightModeBtn = widget.NewButton("Nightmode: Off", func() {
+		if onNightModeToggle != nil {
+			onNightModeToggle()
+		}
+	})
+
 	exitBtn := widget.NewButton("Exit", func() {
 		if onExit != nil {
 			onExit()
 		}
 	})
 
-	t.content = container.NewCenter(container.NewVBox(restartBtn, exitBtn))
+	t.content = container.NewCenter(container.NewVBox(restartBtn, t.nightModeBtn, exitBtn))
 	t.ExtendBaseWidget(t)
 	return t
+}
+
+// SetNightModeLabel updates the night mode button label.
+func (t *TappableSettings) SetNightModeLabel(enabled bool) {
+	if t.nightModeBtn == nil {
+		return
+	}
+	if enabled {
+		t.nightModeBtn.SetText("Nightmode: On")
+	} else {
+		t.nightModeBtn.SetText("Nightmode: Off")
+	}
 }
 
 func (t *TappableSettings) CreateRenderer() fyne.WidgetRenderer {
@@ -422,7 +461,7 @@ func (a *App) setupUI() {
 	// Dark background
 	background := canvas.NewRectangle(color.RGBA{20, 20, 20, 255})
 
-	// Settings widget with Restart/Exit buttons and swap support
+	// Settings widget with Restart/Night Mode/Exit buttons and swap support
 	var settingsWidget *TappableSettings
 	settingsWidget = NewTappableSettings(
 		func() {
@@ -432,6 +471,10 @@ func (a *App) setupUI() {
 		func() {
 			log.Println("[UI] Exit clicked")
 			a.cleanup()
+		},
+		func() {
+			a.toggleNightMode()
+			settingsWidget.SetNightModeLabel(a.nightModeEnabled)
 		},
 		func() { a.onWidgetTap(settingsWidget) },
 		func() { a.onWidgetLongPress(settingsWidget) },
@@ -471,8 +514,10 @@ func (a *App) setupUI() {
 	a.cameraWidgets[2] = cam3
 	cam3.SetDisconnected(true) // Start disconnected until camera detected
 
-	// 2x2 grid (positions: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right)
-	a.grid = container.New(&fillGridLayout{rows: 2, cols: 2},
+	// Dynamic grid layout based on number of widgets (settings + cameras)
+	totalSlots := 1 + a.cfg.CameraSlotCount // 1 settings panel + N camera slots
+	gridRows, gridCols := helpers.GetSmartGrid(totalSlots)
+	a.grid = container.New(&fillGridLayout{rows: gridRows, cols: gridCols},
 		settingsWidget, cam1,
 		cam2, cam3,
 	)
@@ -667,7 +712,11 @@ func (a *App) showFullscreen(gridPos int) {
 	a.frameLock.RUnlock()
 
 	if currentFrame != nil {
-		a.fullscreenImg.Image = currentFrame
+		displayFrame := currentFrame
+		if a.nightModeEnabled {
+			displayFrame = applyNightMode(currentFrame)
+		}
+		a.fullscreenImg.Image = displayFrame
 		a.fullscreenImg.Refresh()
 	}
 
@@ -705,7 +754,13 @@ func (a *App) updateFullscreenLoop(camIndex int) {
 		a.frameLock.RUnlock()
 
 		if frame != nil && a.fullscreenImg != nil {
-			a.fullscreenImg.Image = frame
+			// Apply night mode filter if enabled
+			displayFrame := frame
+			if a.nightModeEnabled {
+				displayFrame = applyNightMode(frame)
+			}
+
+			a.fullscreenImg.Image = displayFrame
 			a.fullscreenImg.Refresh()
 		}
 	}
@@ -719,14 +774,30 @@ func (a *App) initializeCamerasAsync() {
 	}()
 
 	log.Println("[UI] Starting camera initialization...")
-	// Use buffer mode for decoupled capture/render
-	a.manager = camera.NewManagerWithBuffers()
+
+	// Kill any processes holding camera devices (e.g., stale FFmpeg from previous run)
+	if a.cfg.KillDeviceHolders {
+		for _, devNum := range []int{0, 2, 4, 6, 8, 10} {
+			devPath := fmt.Sprintf("/dev/video%d", devNum)
+			if _, err := os.Stat(devPath); err == nil {
+				helpers.KillDeviceHolders(devPath, true)
+			}
+		}
+	}
+
+	// Use buffer mode for decoupled capture/render with config-driven settings
+	a.manager = camera.NewManagerWithSettings(camera.Settings{
+		Width:  a.cfg.CaptureWidth,
+		Height: a.cfg.CaptureHeight,
+		FPS:    a.cfg.CaptureFPS,
+		Format: camera.DefaultFormat,
+	}, true)
 
 	if err := a.manager.Initialize(); err != nil {
 		log.Printf("[UI] Camera init error: %v", err)
 		return
 	}
-	log.Println("[UI] Manager initialized (buffer mode)")
+	log.Println("[UI] Manager initialized (buffer mode, config-driven settings)")
 
 	if err := a.manager.Start(); err != nil {
 		log.Printf("[UI] Camera start error: %v", err)
@@ -743,7 +814,7 @@ func (a *App) initializeCamerasAsync() {
 		}
 	}
 
-	a.perfController = perf.NewAdaptiveController(a.manager)
+	a.perfController = perf.NewAdaptiveController(a.manager, a.cfg)
 	a.perfController.Start()
 }
 
@@ -780,14 +851,21 @@ func (a *App) startCameraRefresh() {
 
 					a.lastFrameRead[camIndex] = frameNum
 
-					// Only lock briefly to update the frame reference
+					// Track frame arrival time for stale detection
 					a.frameLock.Lock()
 					a.cameraFrames[camIndex] = frame
+					a.lastFrameTime[camIndex] = time.Now()
 					a.frameLock.Unlock()
+
+					// Apply night mode filter if enabled
+					displayFrame := frame
+					if a.nightModeEnabled {
+						displayFrame = applyNightMode(frame)
+					}
 
 					// Update the camera image widget
 					// Fyne's Refresh is thread-safe but can be slow if backed up
-					a.cameraImages[camIndex].Image = frame
+					a.cameraImages[camIndex].Image = displayFrame
 					a.cameraImages[camIndex].Refresh()
 
 					frameCounters[cameraID]++
@@ -808,10 +886,17 @@ func (a *App) startCameraRefresh() {
 					case frame := <-frameCh:
 						a.frameLock.Lock()
 						a.cameraFrames[camIndex] = frame
+						a.lastFrameTime[camIndex] = time.Now()
 						a.frameLock.Unlock()
 
+						// Apply night mode filter if enabled
+						displayFrame := frame
+						if a.nightModeEnabled {
+							displayFrame = applyNightMode(frame)
+						}
+
 						// Update the camera image widget
-						a.cameraImages[camIndex].Image = frame
+						a.cameraImages[camIndex].Image = displayFrame
 						a.cameraImages[camIndex].Refresh()
 
 						frameCounters[cameraID]++
@@ -845,6 +930,248 @@ func (a *App) updateCameraStatus(camIndex int, connected bool) {
 	if a.cameraWidgets[camIndex] != nil {
 		a.cameraWidgets[camIndex].SetDisconnected(!connected)
 	}
+}
+
+// =============================================================================
+// Night Mode
+// =============================================================================
+
+// toggleNightMode toggles the night mode state and logs the change.
+func (a *App) toggleNightMode() {
+	a.nightModeEnabled = !a.nightModeEnabled
+	if a.nightModeEnabled {
+		log.Println("[UI] Night mode enabled")
+	} else {
+		log.Println("[UI] Night mode disabled")
+	}
+}
+
+// =============================================================================
+// Health Logging
+// =============================================================================
+// Periodic summary of camera health: online, stale, and disconnected counts.
+// Matches Python's log_health_summary() from utils/helpers.py.
+// =============================================================================
+
+// startHealthLogging periodically logs camera health status.
+// Disabled when HealthLogIntervalSec <= 0.
+func (a *App) startHealthLogging() {
+	interval := a.cfg.HealthLogIntervalSec
+	if interval <= 0 {
+		log.Println("[Health] Health logging disabled (interval <= 0)")
+		return
+	}
+
+	log.Printf("[Health] Starting health logging (every %.0fs)...", interval)
+
+	ticker := time.NewTicker(time.Duration(interval * float64(time.Second)))
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.hotplugStopCh:
+			return
+		case <-ticker.C:
+			a.logHealthSummary()
+		}
+	}
+}
+
+// logHealthSummary logs the current health status of all camera slots.
+// Counts cameras as online (fresh frame), stale (frame older than threshold),
+// or disconnected (not connected).
+func (a *App) logHealthSummary() {
+	if a.manager == nil {
+		return
+	}
+
+	now := time.Now()
+	staleThreshold := 10.0 // seconds — matches Python default
+	online := 0
+	stale := 0
+	disconnected := 0
+	totalSlots := a.cfg.CameraSlotCount
+
+	for camIndex := 0; camIndex < totalSlots && camIndex < 3; camIndex++ {
+		if !a.cameraStatus[camIndex] {
+			disconnected++
+			continue
+		}
+
+		a.frameLock.RLock()
+		lastFrame := a.lastFrameTime[camIndex]
+		a.frameLock.RUnlock()
+
+		if lastFrame.IsZero() {
+			// Never received a frame — treat as stale
+			stale++
+			log.Printf("[Health] WARNING: camera %d has never produced a frame", camIndex)
+			continue
+		}
+
+		age := now.Sub(lastFrame).Seconds()
+		if age > staleThreshold {
+			stale++
+			log.Printf("[Health] WARNING: camera %d frame is stale (%.1fs old)", camIndex, age)
+		} else {
+			online++
+		}
+	}
+
+	log.Printf("[Health] cameras online=%d stale=%d disconnected=%d total_slots=%d",
+		online, stale, disconnected, totalSlots)
+}
+
+// =============================================================================
+// Stale Frame Detection + Bounded Auto-Restart
+// =============================================================================
+// Matches Python's _restart_capture_if_stale() policy:
+//   - STALE_FRAME_TIMEOUT_SEC: time before a frame is considered stale
+//   - RESTART_COOLDOWN_SEC: minimum time between restarts for one camera
+//   - MAX_RESTARTS_PER_WINDOW: max restarts allowed in RESTART_WINDOW_SEC
+//   - Extended cooldown (2x window) when limit is reached
+// =============================================================================
+
+// startStaleFrameDetection periodically checks for cameras that have stopped
+// producing frames and restarts their capture workers.
+func (a *App) startStaleFrameDetection() {
+	log.Println("[Stale] Starting stale frame detection...")
+
+	// Check every 500ms for responsiveness
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.hotplugStopCh:
+			return
+		case <-ticker.C:
+			a.checkStaleFrames()
+		}
+	}
+}
+
+// checkStaleFrames checks each connected camera for stale frames
+func (a *App) checkStaleFrames() {
+	if a.manager == nil || len(a.cameras) == 0 {
+		return
+	}
+
+	now := time.Now()
+	staleTimeout := time.Duration(a.cfg.StaleFrameTimeoutSec * float64(time.Second))
+
+	for camIndex := 0; camIndex < 3 && camIndex < len(a.cameras); camIndex++ {
+		if !a.cameraStatus[camIndex] {
+			continue // Skip disconnected cameras
+		}
+
+		a.frameLock.RLock()
+		lastFrame := a.lastFrameTime[camIndex]
+		a.frameLock.RUnlock()
+
+		// Skip if we haven't received any frames yet (still initializing)
+		if lastFrame.IsZero() {
+			continue
+		}
+
+		// Check if frame is stale
+		staleDuration := now.Sub(lastFrame)
+		if staleDuration <= staleTimeout {
+			continue // Frame is fresh
+		}
+
+		log.Printf("[Stale] Camera %d: stale frame detected (no frames for %.1fs)",
+			camIndex, staleDuration.Seconds())
+
+		// Mark as disconnected in UI
+		a.updateCameraStatus(camIndex, false)
+
+		// Attempt bounded auto-restart
+		a.restartCaptureIfStale(camIndex)
+	}
+}
+
+// restartCaptureIfStale implements the bounded restart policy matching Python's
+// _restart_capture_if_stale(). Enforces:
+//   - Cooldown between restarts (RESTART_COOLDOWN_SEC)
+//   - Sliding window restart limit (MAX_RESTARTS_PER_WINDOW in RESTART_WINDOW_SEC)
+//   - Extended cooldown (2x window) when limit is reached
+func (a *App) restartCaptureIfStale(camIndex int) {
+	now := time.Now()
+	cooldown := time.Duration(a.cfg.RestartCooldownSec * float64(time.Second))
+	window := time.Duration(a.cfg.RestartWindowSec * float64(time.Second))
+	extendedCooldown := window * 2
+
+	// Check cooldown
+	if !a.lastRestartTime[camIndex].IsZero() && now.Sub(a.lastRestartTime[camIndex]) < cooldown {
+		return // Still in cooldown
+	}
+
+	// Count recent restarts in the sliding window
+	recentCount := 0
+	for _, t := range a.restartEvents[camIndex] {
+		if now.Sub(t) <= window {
+			recentCount++
+		}
+	}
+
+	if recentCount >= a.cfg.MaxRestartsPerWindow {
+		// Restart limit reached - check extended cooldown
+		if !a.lastRestartTime[camIndex].IsZero() && now.Sub(a.lastRestartTime[camIndex]) < extendedCooldown {
+			if !a.restartLimitHit[camIndex] {
+				log.Printf("[Stale] Camera %d: restart limit reached (%d/%d in %.0fs), will retry in %.0fs",
+					camIndex, recentCount, a.cfg.MaxRestartsPerWindow,
+					a.cfg.RestartWindowSec, extendedCooldown.Seconds())
+				a.restartLimitHit[camIndex] = true
+			}
+			return
+		}
+
+		// Extended cooldown passed - clear events and allow restart
+		log.Printf("[Stale] Camera %d: extended cooldown passed, attempting recovery", camIndex)
+		a.restartEvents[camIndex] = nil
+		a.restartLimitHit[camIndex] = false
+	}
+
+	// Record this restart event
+	a.restartEvents[camIndex] = append(a.restartEvents[camIndex], now)
+	a.lastRestartTime[camIndex] = now
+
+	// Clean up old events outside the window
+	var filtered []time.Time
+	for _, t := range a.restartEvents[camIndex] {
+		if now.Sub(t) <= window*2 { // Keep slightly more history
+			filtered = append(filtered, t)
+		}
+	}
+	a.restartEvents[camIndex] = filtered
+
+	log.Printf("[Stale] Camera %d: restarting capture worker after stale frames", camIndex)
+
+	go func(idx int) {
+		if a.manager == nil {
+			return
+		}
+
+		// Kill any processes holding this camera device before restart
+		if idx < len(a.cameras) {
+			helpers.KillDeviceHolders(a.cameras[idx].DevicePath, a.cfg.KillDeviceHolders)
+		}
+
+		if err := a.manager.RestartCameraByIndex(idx); err != nil {
+			log.Printf("[Stale] Camera %d: failed to restart: %v", idx, err)
+			return
+		}
+
+		// Reset frame time so we don't immediately re-trigger
+		a.frameLock.Lock()
+		a.lastFrameTime[idx] = time.Now()
+		a.frameLock.Unlock()
+
+		// Mark as connected again
+		a.updateCameraStatus(idx, true)
+		log.Printf("[Stale] Camera %d: successfully restarted", idx)
+	}(camIndex)
 }
 
 // startHotplugDetection starts a goroutine that polls for camera connect/disconnect
@@ -938,7 +1265,7 @@ func (a *App) checkForNewCameras() {
 		// Check if device exists
 		if _, err := os.Stat(devPath); err == nil {
 			// Verify it's a USB camera by checking if it's a capture device
-			if a.isUSBCaptureDevice(devPath) {
+			if a.isUSBCaptureDevice(devPath, existingPaths) {
 				log.Printf("[Hotplug] New USB camera detected at %s", devPath)
 				a.handleNewCameraDevice(devPath)
 				return // Only handle one at a time
@@ -947,9 +1274,28 @@ func (a *App) checkForNewCameras() {
 	}
 }
 
+// getUSBParent returns the sysfs USB parent path for a /dev/videoX device.
+// Two video nodes from the same physical USB camera share the same parent.
+// Returns "" if the parent cannot be determined.
+func getUSBParent(devPath string) string {
+	var videoNum int
+	_, err := fmt.Sscanf(devPath, "/dev/video%d", &videoNum)
+	if err != nil {
+		return ""
+	}
+	// Resolve the physical device symlink and go up one level to the USB device
+	symlinkPath := fmt.Sprintf("/sys/class/video4linux/video%d/device", videoNum)
+	resolved, err := filepath.EvalSymlinks(symlinkPath)
+	if err != nil {
+		return ""
+	}
+	return filepath.Dir(resolved)
+}
+
 // isUSBCaptureDevice checks if a device path is a USB video capture device
-// Uses sysfs instead of v4l2-ctl to avoid conflicts with active FFmpeg capture
-func (a *App) isUSBCaptureDevice(devPath string) bool {
+// that is NOT a secondary node of an already-tracked camera.
+// Uses sysfs instead of v4l2-ctl to avoid conflicts with active FFmpeg capture.
+func (a *App) isUSBCaptureDevice(devPath string, existingPaths map[string]bool) bool {
 	// Extract video number from path (e.g., /dev/video0 -> 0)
 	var videoNum int
 	_, err := fmt.Sscanf(devPath, "/dev/video%d", &videoNum)
@@ -972,7 +1318,25 @@ func (a *App) isUSBCaptureDevice(devPath string) bool {
 	}
 
 	// USB devices have modalias starting with "usb:"
-	return strings.HasPrefix(string(data), "usb:")
+	if !strings.HasPrefix(string(data), "usb:") {
+		return false
+	}
+
+	// Reject secondary nodes that share a USB parent with an already-tracked camera.
+	// Multi-function USB cameras (e.g. UVC webcams) register multiple /dev/videoX nodes
+	// under the same physical USB device. Only the primary capture node (typically the
+	// lowest-numbered) should be treated as a camera.
+	candidateParent := getUSBParent(devPath)
+	if candidateParent == "" {
+		return false
+	}
+	for existingPath := range existingPaths {
+		if getUSBParent(existingPath) == candidateParent {
+			return false // Same physical device as an already-tracked camera
+		}
+	}
+
+	return true
 }
 
 // handleNewCameraDevice handles a newly detected camera device
@@ -1021,8 +1385,13 @@ func (a *App) handleNewCameraDevice(devPath string) {
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		// Use buffer mode for decoupled capture/render
-		a.manager = camera.NewManagerWithBuffers()
+		// Use buffer mode for decoupled capture/render with config-driven settings
+		a.manager = camera.NewManagerWithSettings(camera.Settings{
+			Width:  a.cfg.CaptureWidth,
+			Height: a.cfg.CaptureHeight,
+			FPS:    a.cfg.CaptureFPS,
+			Format: camera.DefaultFormat,
+		}, true)
 		if err := a.manager.Initialize(); err != nil {
 			log.Printf("[Hotplug] Failed to reinitialize manager: %v", err)
 			return
@@ -1075,6 +1444,11 @@ func (a *App) handleCameraReconnect(camIndex int) {
 
 		// Let the device settle after reconnection
 		time.Sleep(1500 * time.Millisecond)
+
+		// Kill any stale processes holding the device before restart
+		if camIndex < len(a.cameras) {
+			helpers.KillDeviceHolders(a.cameras[camIndex].DevicePath, a.cfg.KillDeviceHolders)
+		}
 
 		// Restart only this camera's worker
 		if a.manager != nil {

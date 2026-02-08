@@ -15,6 +15,7 @@ type Manager struct {
 	frameChannels map[string]chan image.Image // Legacy channel mode
 	frameBuffers  map[string]*FrameBuffer     // New buffer mode (preferred)
 	useBufferMode bool                        // If true, use FrameBuffer instead of channels
+	settings      Settings                    // Camera capture settings from config
 	running       bool
 	mutex         sync.RWMutex
 }
@@ -25,6 +26,7 @@ func NewManager() *Manager {
 		frameChannels: make(map[string]chan image.Image),
 		frameBuffers:  make(map[string]*FrameBuffer),
 		useBufferMode: false,
+		settings:      DefaultSettings(),
 	}
 }
 
@@ -34,7 +36,37 @@ func NewManagerWithBuffers() *Manager {
 		frameChannels: make(map[string]chan image.Image),
 		frameBuffers:  make(map[string]*FrameBuffer),
 		useBufferMode: true,
+		settings:      DefaultSettings(),
 	}
+}
+
+// NewManagerWithSettings creates a manager with explicit settings from config
+func NewManagerWithSettings(s Settings, useBuffers bool) *Manager {
+	// Apply defaults for zero values
+	if s.Width == 0 {
+		s.Width = DefaultWidth
+	}
+	if s.Height == 0 {
+		s.Height = DefaultHeight
+	}
+	if s.FPS == 0 {
+		s.FPS = DefaultFPS
+	}
+	if s.Format == "" {
+		s.Format = DefaultFormat
+	}
+
+	return &Manager{
+		frameChannels: make(map[string]chan image.Image),
+		frameBuffers:  make(map[string]*FrameBuffer),
+		useBufferMode: useBuffers,
+		settings:      s,
+	}
+}
+
+// GetSettings returns the manager's camera settings
+func (m *Manager) GetSettings() Settings {
+	return m.settings
 }
 
 // Initialize discovers and initializes cameras
@@ -48,7 +80,7 @@ func (m *Manager) Initialize() error {
 
 	log.Println("[Manager] Discovering cameras...")
 	// Discover cameras
-	cameras, err := DiscoverCameras()
+	cameras, err := DiscoverCamerasWithSettings(m.settings)
 	if err != nil {
 		log.Printf("[Manager] Camera discovery failed: %v", err)
 		return err
@@ -70,12 +102,12 @@ func (m *Manager) Initialize() error {
 		if m.useBufferMode {
 			// New FrameBuffer mode - decoupled capture from UI
 			buffer := NewFrameBuffer()
-			worker = NewCaptureWorkerWithBuffer(camera, buffer)
+			worker = NewCaptureWorkerWithBuffer(camera, buffer, m.settings)
 			m.frameBuffers[camera.DeviceID] = buffer
 		} else {
 			// Legacy channel mode
 			frameCh := make(chan image.Image, 1) // Latest-frame-only buffer
-			worker = NewCaptureWorker(camera, frameCh)
+			worker = NewCaptureWorker(camera, frameCh, m.settings)
 			m.frameChannels[camera.DeviceID] = frameCh
 		}
 

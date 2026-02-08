@@ -2,6 +2,7 @@ package perf
 
 import (
 	"camera-dashboard-go/internal/camera"
+	"camera-dashboard-go/internal/config"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -32,19 +33,21 @@ const (
 	LoadHigh  = 3.8 // High but not overloaded
 )
 
-// FPS limits - uses settings from camera/config.go
-// These are fallbacks if config can't be read
+// FPS limits - fallbacks if config is nil
 const (
 	MinFPS     = 10 // Absolute minimum for usability
 	MaxFPS     = 30 // Absolute maximum
 	DefaultFPS = 15 // Default if config unavailable
 )
 
-// SmartController manages dynamic FPS adjustment
-// Resolution is always max (640x480) - only FPS adapts
+// SmartController manages dynamic FPS adjustment based on system thermals
+// and CPU load. When dynamic FPS is enabled (via config), it uses a state
+// machine (Probing -> Stable -> Recovering -> Emergency) to find and
+// maintain the highest sustainable FPS. When disabled, it runs at fixed FPS.
 type SmartController struct {
 	monitor *Monitor
 	manager *camera.Manager
+	cfg     *config.Config
 
 	// FPS control
 	currentFPS   int
@@ -52,11 +55,18 @@ type SmartController struct {
 	minFPS       int
 	maxFPS       int
 
+	// Dynamic FPS mode
+	dynamicEnabled bool
+
 	// State machine
 	state          atomic.Int32
 	stateEnterTime time.Time
 	stabilityCount int
 	lastChange     time.Time
+
+	// Stress-based tracking (matches Python's stress_hold_count / recover_hold_count)
+	stressCount  int // Consecutive ticks under stress
+	recoverCount int // Consecutive ticks in recovery conditions
 
 	// Thermal tracking
 	tempHistory []float64
@@ -72,16 +82,26 @@ type SmartController struct {
 	stopCh  chan struct{}
 }
 
-// NewSmartController creates a simple fixed-FPS controller
-// Uses FPS from camera/config.go - no runtime adaptation
-func NewSmartController(manager *camera.Manager) *SmartController {
-	// Get FPS from config
-	_, _, configFPS, _ := camera.GetCameraConfig()
-	if configFPS < MinFPS {
-		configFPS = MinFPS
+// NewSmartController creates a performance controller.
+// If cfg is nil, uses built-in defaults with dynamic FPS disabled.
+// If cfg.DynamicFPSEnabled is true, the controller actively adapts FPS
+// based on CPU temperature and load.
+func NewSmartController(manager *camera.Manager, cfg *config.Config) *SmartController {
+	if cfg == nil {
+		cfg = config.DefaultConfig()
+		cfg.DynamicFPSEnabled = false // Safe default without config
 	}
-	if configFPS > MaxFPS {
-		configFPS = MaxFPS
+
+	captureFPS := cfg.CaptureFPS
+	minFPS := cfg.MinDynamicFPS
+	if minFPS < MinFPS {
+		minFPS = MinFPS
+	}
+	if captureFPS < minFPS {
+		captureFPS = minFPS
+	}
+	if captureFPS > MaxFPS {
+		captureFPS = MaxFPS
 	}
 
 	numCameras := 0
@@ -90,8 +110,8 @@ func NewSmartController(manager *camera.Manager) *SmartController {
 		numCameras = len(cameras)
 	}
 
-	// Validate config and log warnings
-	ok, warnings := camera.ValidateConfig()
+	// Validate config
+	ok, warnings := cfg.Validate()
 	if !ok {
 		log.Printf("[SmartCtrl] WARNING: Config validation failed!")
 	}
@@ -100,36 +120,54 @@ func NewSmartController(manager *camera.Manager) *SmartController {
 	}
 
 	sc := &SmartController{
-		monitor:      NewMonitor(),
-		manager:      manager,
-		minFPS:       configFPS, // Same as max - no adaptation
-		maxFPS:       configFPS, // Fixed at configured FPS
-		currentFPS:   configFPS,
-		sweetSpotFPS: configFPS,
-		tempHistory:  make([]float64, 0, 10),
-		stopCh:       make(chan struct{}),
+		monitor:        NewMonitor(),
+		manager:        manager,
+		cfg:            cfg,
+		dynamicEnabled: cfg.DynamicFPSEnabled,
+		tempHistory:    make([]float64, 0, 10),
+		stopCh:         make(chan struct{}),
 	}
 
-	w, h, fps, format := camera.GetCameraConfig()
-	log.Printf("[SmartCtrl] Config: %dx%d @ %d FPS (%s) for %d cameras (fixed, no adaptation)",
-		w, h, fps, format, numCameras)
+	if cfg.DynamicFPSEnabled {
+		// Dynamic mode: min and max differ, start with probing
+		sc.minFPS = minFPS
+		sc.maxFPS = captureFPS
+		sc.currentFPS = captureFPS // Start at configured FPS, probe downward if needed
+		sc.sweetSpotFPS = captureFPS
+		log.Printf("[SmartCtrl] Config: %dx%d @ %d FPS for %d cameras (dynamic adaptation enabled, min=%d)",
+			cfg.CaptureWidth, cfg.CaptureHeight, captureFPS, numCameras, minFPS)
+	} else {
+		// Fixed mode: no adaptation
+		sc.minFPS = captureFPS
+		sc.maxFPS = captureFPS
+		sc.currentFPS = captureFPS
+		sc.sweetSpotFPS = captureFPS
+		log.Printf("[SmartCtrl] Config: %dx%d @ %d FPS for %d cameras (fixed, no adaptation)",
+			cfg.CaptureWidth, cfg.CaptureHeight, captureFPS, numCameras)
+	}
+
 	return sc
 }
 
-// Start begins monitoring (no FPS adaptation - uses config.go settings)
+// Start begins monitoring and optional FPS adaptation.
 func (sc *SmartController) Start() {
 	if sc.running.Swap(true) {
 		return
 	}
 
-	sc.state.Store(StateStable) // Always stable - no adaptation
 	sc.stateEnterTime = time.Now()
 	sc.lastChange = time.Now()
 
-	// Apply configured FPS
-	sc.applyFPS(sc.maxFPS)
+	if sc.dynamicEnabled {
+		sc.state.Store(StateProbing)
+		log.Printf("[SmartCtrl] Started - dynamic FPS %d-%d, probing for sweet spot", sc.minFPS, sc.maxFPS)
+	} else {
+		sc.state.Store(StateStable)
+		log.Printf("[SmartCtrl] Started - fixed %d FPS, monitoring only", sc.maxFPS)
+	}
 
-	log.Printf("[SmartCtrl] Started - fixed %d FPS, monitoring only (edit config.go to change)", sc.maxFPS)
+	// Apply initial FPS
+	sc.applyFPS(sc.currentFPS)
 
 	go sc.controlLoop()
 }
@@ -142,9 +180,15 @@ func (sc *SmartController) Stop() {
 	close(sc.stopCh)
 }
 
-// controlLoop runs every second
+// controlLoop runs the main control tick
 func (sc *SmartController) controlLoop() {
-	ticker := time.NewTicker(1 * time.Second)
+	// Use config's perf check interval, defaulting to 1 second
+	interval := time.Duration(sc.cfg.PerfCheckIntervalMS) * time.Millisecond
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+
+	ticker := time.NewTicker(1 * time.Second) // Tick every second for responsiveness
 	defer ticker.Stop()
 
 	logTicker := time.NewTicker(5 * time.Second)
@@ -162,7 +206,7 @@ func (sc *SmartController) controlLoop() {
 	}
 }
 
-// tick performs one monitoring cycle (no FPS changes for vehicle mode)
+// tick performs one monitoring + adaptation cycle
 func (sc *SmartController) tick() {
 	if err := sc.monitor.UpdateStats(); err != nil {
 		return
@@ -172,20 +216,34 @@ func (sc *SmartController) tick() {
 	defer sc.mutex.Unlock()
 
 	temp := sc.monitor.GetTemperature()
+	load := sc.monitor.GetLoadAverage()
 
 	sc.updateTempTrend(temp)
 
-	// Vehicle mode: just monitor, don't change FPS
-	// Only log warnings for extreme temperatures
-	if temp >= TempCritical {
-		log.Printf("[SmartCtrl] WARNING: Temperature critical (%.1f°C) - consider improving ventilation", temp)
+	if !sc.dynamicEnabled {
+		// Fixed mode: monitor only, warn on critical temps
+		if temp >= TempCritical {
+			log.Printf("[SmartCtrl] WARNING: Temperature critical (%.1f°C) - consider improving ventilation", temp)
+		}
+		if sc.state.Load() != StateStable {
+			sc.state.Store(StateStable)
+		}
+		sc.stableSeconds.Add(1)
+		return
 	}
 
-	// Always stay stable in vehicle mode
-	if sc.state.Load() != StateStable {
-		sc.state.Store(StateStable)
+	// Dynamic mode: dispatch to state handlers
+	state := sc.state.Load()
+	switch state {
+	case StateProbing:
+		sc.handleProbing(temp, load)
+	case StateStable:
+		sc.handleStable(temp, load)
+	case StateRecovering:
+		sc.handleRecovering(temp)
+	case StateEmergency:
+		sc.handleEmergency(temp)
 	}
-	sc.stableSeconds.Add(1)
 }
 
 // updateTempTrend tracks temperature changes
@@ -225,12 +283,20 @@ func (sc *SmartController) handleProbing(temp, load float64) {
 		return
 	}
 
-	// Is current FPS sustainable?
-	isSustainable := (temp < TempWarm) || (temp < TempHot && sc.tempTrend <= 0)
+	// Is current FPS sustainable? Use config thresholds
+	cpuLoadThresh := sc.cfg.CPULoadThreshold
+	cpuTempThresh := sc.cfg.CPUTempThresholdC
+
+	// Stress detection using config thresholds
+	isUnderStress := temp >= cpuTempThresh || load >= cpuLoadThresh
 	isLoadOK := load < LoadHigh
 
-	if isSustainable && isLoadOK {
+	// Check sustainability with thermal thresholds
+	isSustainable := (temp < TempWarm) || (temp < TempHot && sc.tempTrend <= 0)
+
+	if isSustainable && isLoadOK && !isUnderStress {
 		sc.stabilityCount++
+		sc.stressCount = 0
 
 		// Stable for 8+ seconds - this FPS works
 		if sc.stabilityCount >= 8 {
@@ -249,25 +315,29 @@ func (sc *SmartController) handleProbing(temp, load float64) {
 			// Try higher FPS if cooling and stable
 			if sc.currentFPS < sc.maxFPS && temp < TempComfort &&
 				sc.tempTrend < 0 && timeSinceChange > 15*time.Second {
-				sc.changeFPS(sc.currentFPS + 2)
+				sc.changeFPS(sc.currentFPS + sc.cfg.UIFPSStep)
 			}
 		}
 	} else {
 		sc.stabilityCount = 0
+		sc.stressCount++
 
-		// Too hot or overloaded - reduce FPS
-		shouldReduce := temp >= TempHot || (temp >= TempWarm && sc.tempTrend > 0.3) || load >= LoadHigh
+		// Use stress hold count from config before reducing
+		if sc.stressCount >= sc.cfg.StressHoldCount {
+			shouldReduce := temp >= TempHot || (temp >= TempWarm && sc.tempTrend > 0.3) || load >= LoadHigh
 
-		if shouldReduce && timeSinceChange > 5*time.Second {
-			newFPS := sc.currentFPS - 3
-			if newFPS < sc.minFPS {
-				newFPS = sc.minFPS
-			}
-			sc.changeFPS(newFPS)
+			if shouldReduce && timeSinceChange > 5*time.Second {
+				newFPS := sc.currentFPS - 3
+				if newFPS < sc.minFPS {
+					newFPS = sc.minFPS
+				}
+				sc.changeFPS(newFPS)
 
-			// Update sweet spot if we had to go lower
-			if newFPS < sc.sweetSpotFPS {
-				sc.sweetSpotFPS = newFPS
+				// Update sweet spot if we had to go lower
+				if newFPS < sc.sweetSpotFPS {
+					sc.sweetSpotFPS = newFPS
+				}
+				sc.stressCount = 0
 			}
 		}
 	}
@@ -284,29 +354,45 @@ func (sc *SmartController) handleStable(temp, load float64) {
 		return
 	}
 
-	// Need to reduce?
-	if temp >= TempHot || (temp >= TempWarm && sc.tempTrend > 0.5) || load >= LoadHigh {
-		log.Printf("[SmartCtrl] Reducing FPS - temp: %.1f°C, load: %.2f", temp, load)
-		newFPS := sc.currentFPS - 2
-		if newFPS < sc.minFPS {
-			newFPS = sc.minFPS
-		}
-		sc.changeFPS(newFPS)
+	// Stress detection using config thresholds
+	cpuLoadThresh := sc.cfg.CPULoadThreshold
+	cpuTempThresh := sc.cfg.CPUTempThresholdC
+	isUnderStress := temp >= cpuTempThresh || load >= cpuLoadThresh
 
-		if newFPS < sc.sweetSpotFPS {
-			sc.sweetSpotFPS = newFPS
-			log.Printf("[SmartCtrl] Sweet spot lowered to %d FPS", sc.sweetSpotFPS)
+	// Need to reduce?
+	if temp >= TempHot || (temp >= TempWarm && sc.tempTrend > 0.5) || load >= LoadHigh || isUnderStress {
+		sc.stressCount++
+
+		if sc.stressCount >= sc.cfg.StressHoldCount {
+			log.Printf("[SmartCtrl] Reducing FPS - temp: %.1f°C, load: %.2f (stress count: %d)",
+				temp, load, sc.stressCount)
+			newFPS := sc.currentFPS - sc.cfg.UIFPSStep
+			if newFPS < sc.minFPS {
+				newFPS = sc.minFPS
+			}
+			sc.changeFPS(newFPS)
+
+			if newFPS < sc.sweetSpotFPS {
+				sc.sweetSpotFPS = newFPS
+				log.Printf("[SmartCtrl] Sweet spot lowered to %d FPS", sc.sweetSpotFPS)
+			}
+			sc.stressCount = 0
+			return
 		}
-		return
+	} else {
+		sc.stressCount = 0
+		sc.recoverCount++
 	}
 
 	// Can we try higher? (after 30+ seconds stable, cooling, well under threshold)
 	stableTime := sc.stableSeconds.Load()
 	if stableTime > 30 && sc.currentFPS < sc.maxFPS &&
-		temp < TempIdeal && sc.tempTrend < 0 && load < LoadIdeal {
+		temp < TempIdeal && sc.tempTrend < 0 && load < LoadIdeal &&
+		sc.recoverCount >= sc.cfg.RecoverHoldCount {
 		log.Printf("[SmartCtrl] Conditions excellent - trying higher FPS")
-		sc.changeFPS(sc.currentFPS + 2)
+		sc.changeFPS(sc.currentFPS + sc.cfg.UIFPSStep)
 		sc.stableSeconds.Store(0)
+		sc.recoverCount = 0
 	}
 }
 
@@ -321,12 +407,18 @@ func (sc *SmartController) handleRecovering(temp float64) {
 
 	// Gradually increase toward sweet spot
 	if temp < TempComfort && sc.tempTrend <= 0 && time.Since(sc.lastChange) > 5*time.Second {
-		if sc.currentFPS < sc.sweetSpotFPS {
-			sc.changeFPS(sc.currentFPS + 2)
-		} else {
-			log.Printf("[SmartCtrl] Recovered to sweet spot: %d FPS", sc.sweetSpotFPS)
-			sc.enterState(StateStable)
+		sc.recoverCount++
+		if sc.recoverCount >= sc.cfg.RecoverHoldCount {
+			if sc.currentFPS < sc.sweetSpotFPS {
+				sc.changeFPS(sc.currentFPS + sc.cfg.UIFPSStep)
+				sc.recoverCount = 0
+			} else {
+				log.Printf("[SmartCtrl] Recovered to sweet spot: %d FPS", sc.sweetSpotFPS)
+				sc.enterState(StateStable)
+			}
 		}
+	} else {
+		sc.recoverCount = 0
 	}
 }
 
@@ -368,6 +460,8 @@ func (sc *SmartController) enterState(state int) {
 	oldState := sc.state.Swap(int32(state))
 	sc.stateEnterTime = time.Now()
 	sc.stabilityCount = 0
+	sc.stressCount = 0
+	sc.recoverCount = 0
 
 	names := []string{"Probing", "Stable", "Recovering", "Emergency"}
 	log.Printf("[SmartCtrl] State: %s -> %s", names[oldState], names[state])
@@ -388,8 +482,14 @@ func (sc *SmartController) logStatus() {
 	temp := sc.monitor.GetTemperature()
 	load := sc.monitor.GetLoadAverage()
 
-	log.Printf("[SmartCtrl] Vehicle mode | FPS: %d (fixed) | Temp: %.1f°C | Load: %.2f | Uptime: %ds",
-		sc.currentFPS, temp, load, sc.stableSeconds.Load())
+	if sc.dynamicEnabled {
+		log.Printf("[SmartCtrl] %s | FPS: %d (sweet=%d, range %d-%d) | Temp: %.1f°C | Load: %.2f | Uptime: %ds",
+			sc.GetState(), sc.currentFPS, sc.sweetSpotFPS, sc.minFPS, sc.maxFPS,
+			temp, load, sc.stableSeconds.Load())
+	} else {
+		log.Printf("[SmartCtrl] Fixed mode | FPS: %d | Temp: %.1f°C | Load: %.2f | Uptime: %ds",
+			sc.currentFPS, temp, load, sc.stableSeconds.Load())
+	}
 }
 
 // GetCurrentFPS returns current FPS
@@ -412,9 +512,14 @@ func (sc *SmartController) GetState() string {
 	return names[sc.state.Load()]
 }
 
+// IsDynamic returns whether dynamic FPS adaptation is enabled
+func (sc *SmartController) IsDynamic() bool {
+	return sc.dynamicEnabled
+}
+
 // Legacy compatibility
 type AdaptiveController = SmartController
 
-func NewAdaptiveController(manager *camera.Manager) *AdaptiveController {
-	return NewSmartController(manager)
+func NewAdaptiveController(manager *camera.Manager, cfg *config.Config) *AdaptiveController {
+	return NewSmartController(manager, cfg)
 }

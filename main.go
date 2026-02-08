@@ -1,6 +1,7 @@
 package main
 
 import (
+	"camera-dashboard-go/internal/config"
 	"camera-dashboard-go/internal/ui"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ func main() {
 	// Command line flags
 	showVersion := flag.Bool("version", false, "Show version information")
 	flag.BoolVar(showVersion, "v", false, "Show version information (shorthand)")
+	configPath := flag.String("config", "", "Path to config.ini (default: ./config.ini or $CAMERA_DASHBOARD_CONFIG)")
 	flag.Parse()
 
 	if *showVersion {
@@ -31,9 +33,37 @@ func main() {
 		os.Exit(0)
 	}
 
-	log.Printf("[Main] Camera Dashboard %s starting...", Version)
+	// Load configuration
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Printf("[Main] WARNING: Config load error: %v (using defaults)", err)
+		cfg = config.DefaultConfig()
+	}
 
-	app := ui.NewApp()
+	// Configure logging (rotating file + optional stdout)
+	logCleanup, err := config.ConfigureLogging(cfg)
+	if err != nil {
+		log.Printf("[Main] WARNING: Logging setup error: %v", err)
+	}
+	if logCleanup != nil {
+		defer logCleanup()
+	}
+
+	log.Printf("[Main] Camera Dashboard %s starting...", Version)
+	log.Printf("[Main] Config: %dx%d @ %d FPS, dynamic=%v, slots=%d",
+		cfg.CaptureWidth, cfg.CaptureHeight, cfg.CaptureFPS,
+		cfg.DynamicFPSEnabled, cfg.CameraSlotCount)
+
+	// Validate config
+	ok, warnings := cfg.Validate()
+	if !ok {
+		log.Printf("[Main] WARNING: Config validation failed!")
+	}
+	for _, w := range warnings {
+		log.Printf("[Main] WARNING: %s", w)
+	}
+
+	app := ui.NewApp(cfg)
 
 	// Setup signal handling for clean shutdown
 	sigCh := make(chan os.Signal, 1)

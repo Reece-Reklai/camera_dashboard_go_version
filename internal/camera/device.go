@@ -30,8 +30,9 @@ type Camera struct {
 	Capabilities CameraCapabilities
 }
 
-// DiscoverCameras finds all available USB camera devices on Linux
-func DiscoverCameras() ([]Camera, error) {
+// DiscoverCamerasWithSettings finds all available USB camera devices on Linux
+// using the provided settings for resolution/FPS defaults.
+func DiscoverCamerasWithSettings(s Settings) ([]Camera, error) {
 	log.Println("[Discovery] Starting camera discovery...")
 	var cameras []Camera
 
@@ -41,7 +42,7 @@ func DiscoverCameras() ([]Camera, error) {
 	if err != nil {
 		log.Printf("[Discovery] v4l2-ctl failed: %v, falling back to simple discovery", err)
 		// Fall back to simple discovery
-		return discoverCamerasSimple()
+		return discoverCamerasSimple(s)
 	}
 
 	log.Printf("[Discovery] v4l2-ctl output:\n%s", string(output))
@@ -106,7 +107,7 @@ func DiscoverCameras() ([]Camera, error) {
 			Name:       cleanCameraName(dev.name),
 			Available:  true,
 		}
-		cam.Capabilities = queryCameraCapabilities(dev.path, numCameras)
+		cam.Capabilities = queryCameraCapabilities(dev.path, numCameras, s)
 		cameras = append(cameras, cam)
 	}
 
@@ -120,7 +121,7 @@ func DiscoverCameras() ([]Camera, error) {
 	// If no cameras found, fall back to simple discovery
 	if len(cameras) == 0 {
 		log.Println("[Discovery] No USB cameras found, falling back to simple discovery")
-		return discoverCamerasSimple()
+		return discoverCamerasSimple(s)
 	}
 
 	log.Printf("[Discovery] Found %d cameras", len(cameras))
@@ -130,6 +131,12 @@ func DiscoverCameras() ([]Camera, error) {
 			cam.Capabilities.MaxFPS, cam.Capabilities.Format)
 	}
 	return cameras, nil
+}
+
+// DiscoverCameras finds all available USB camera devices using default settings.
+// Prefer DiscoverCamerasWithSettings for config-driven discovery.
+func DiscoverCameras() ([]Camera, error) {
+	return DiscoverCamerasWithSettings(DefaultSettings())
 }
 
 // isUSBCamera checks if the device name indicates a USB camera
@@ -172,15 +179,10 @@ type ResolutionPreset struct {
 	Priority int // Higher = better match
 }
 
-// Vehicle-optimized fixed resolution
-// Settings are defined in config.go - edit that file to change resolution/FPS
-// Run: ./camera-dashboard --query-cameras to see what your cameras support
-
-// getOptimalResolution returns the configured resolution from config.go
-// Falls back to closest available if camera doesn't support exact resolution
-func getOptimalResolution(availableResolutions []ResolutionPreset, numCameras int) (int, int) {
-	// Use settings from config.go
-	targetW, targetH := CameraWidth, CameraHeight
+// getOptimalResolution returns the configured resolution from settings.
+// Falls back to closest available if camera doesn't support exact resolution.
+func getOptimalResolution(availableResolutions []ResolutionPreset, numCameras int, s Settings) (int, int) {
+	targetW, targetH := s.Width, s.Height
 
 	// Check if exact resolution is available
 	for _, res := range availableResolutions {
@@ -217,15 +219,14 @@ func abs(x int) int {
 	return x
 }
 
-// queryCameraCapabilities queries the camera's resolution and FPS capabilities
-// Returns optimal settings based on camera, display, and Pi constraints
-func queryCameraCapabilities(devicePath string, numCameras int) CameraCapabilities {
-	// Use config.go values as defaults
+// queryCameraCapabilities queries the camera's resolution and FPS capabilities.
+// Returns optimal settings based on camera, display, and Pi constraints.
+func queryCameraCapabilities(devicePath string, numCameras int, s Settings) CameraCapabilities {
 	caps := CameraCapabilities{
-		MaxWidth:  CameraWidth,
-		MaxHeight: CameraHeight,
-		MaxFPS:    CameraFPS,
-		Format:    CameraFormat,
+		MaxWidth:  s.Width,
+		MaxHeight: s.Height,
+		MaxFPS:    s.FPS,
+		Format:    s.Format,
 	}
 
 	cmd := exec.Command("v4l2-ctl", "-d", devicePath, "--list-formats-ext")
@@ -281,23 +282,22 @@ func queryCameraCapabilities(devicePath string, numCameras int) CameraCapabiliti
 
 	// Pick optimal resolution
 	if len(availableResolutions) > 0 {
-		caps.MaxWidth, caps.MaxHeight = getOptimalResolution(availableResolutions, numCameras)
+		caps.MaxWidth, caps.MaxHeight = getOptimalResolution(availableResolutions, numCameras, s)
 	}
 
 	// Limit FPS based on number of cameras to reduce USB bandwidth contention
 	// USB 2.0 bandwidth is limited (~35MB/s real-world shared across all devices)
 	// At 640x480 MJPEG, each frame is ~20-40KB, so 30fps = 0.6-1.2MB/s per camera
 	// With 2+ cameras, we can get USB buffer overruns causing stream failures
-	caps.MaxFPS = getOptimalFPS(caps.MaxFPS, numCameras)
+	caps.MaxFPS = getOptimalFPS(caps.MaxFPS, numCameras, s)
 
 	return caps
 }
 
-// getOptimalFPS returns the configured FPS from config.go
-// Caps at camera's max FPS if camera doesn't support the configured value
-func getOptimalFPS(cameraMaxFPS int, numCameras int) int {
-	// Use settings from config.go
-	targetFPS := CameraFPS
+// getOptimalFPS returns the configured FPS from settings.
+// Caps at camera's max FPS if camera doesn't support the configured value.
+func getOptimalFPS(cameraMaxFPS int, numCameras int, s Settings) int {
+	targetFPS := s.FPS
 
 	if targetFPS <= cameraMaxFPS {
 		return targetFPS
@@ -310,7 +310,7 @@ func getOptimalFPS(cameraMaxFPS int, numCameras int) int {
 }
 
 // discoverCamerasSimple is a fallback discovery method
-func discoverCamerasSimple() ([]Camera, error) {
+func discoverCamerasSimple(s Settings) ([]Camera, error) {
 	var cameras []Camera
 	var devicePaths []string
 
@@ -350,7 +350,7 @@ func discoverCamerasSimple() ([]Camera, error) {
 			Name:       fmt.Sprintf("Camera %d", i+1),
 			Available:  true,
 		}
-		cam.Capabilities = queryCameraCapabilities(devicePath, numCameras)
+		cam.Capabilities = queryCameraCapabilities(devicePath, numCameras, s)
 		cameras = append(cameras, cam)
 	}
 
