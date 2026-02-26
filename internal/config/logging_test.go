@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -186,4 +187,48 @@ func TestConfigureLogging_NoWriters_FallsBackToStdout(t *testing.T) {
 	}
 	defer cleanup()
 	// Should not panic - falls back to stdout
+}
+
+func TestParseLogLevel(t *testing.T) {
+	tests := []struct {
+		input string
+		want  LogLevel
+	}{
+		{"DEBUG", LevelDebug},
+		{"info", LevelInfo},
+		{"warning", LevelWarning},
+		{"ERROR", LevelError},
+		{"critical", LevelCritical},
+		{"", LevelInfo},
+		{"unknown", LevelInfo},
+	}
+
+	for _, tc := range tests {
+		if got := parseLogLevel(tc.input); got != tc.want {
+			t.Errorf("parseLogLevel(%q) = %v, want %v", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestLevelFilterWriter(t *testing.T) {
+	var buf bytes.Buffer
+	w := &levelFilterWriter{
+		minLevel: LevelWarning,
+		next:     &buf,
+	}
+
+	// Untagged message is treated as INFO and filtered out at WARNING threshold.
+	if _, err := w.Write([]byte("2026/01/01 [UI] started\n")); err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("expected info message to be filtered, got %q", buf.String())
+	}
+
+	if _, err := w.Write([]byte("2026/01/01 WARNING something happened\n")); err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "WARNING") {
+		t.Fatalf("expected warning message to pass filter, got %q", buf.String())
+	}
 }

@@ -32,6 +32,9 @@ func NewManagerWithSettings(s Settings, useBuffers bool) *Manager {
 	if s.Format == "" {
 		s.Format = DefaultFormat
 	}
+	if s.MaxCameras <= 0 {
+		s.MaxCameras = DefaultMaxCameras
+	}
 
 	return &Manager{
 		frameBuffers: make(map[string]*FrameBuffer),

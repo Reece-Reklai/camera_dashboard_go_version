@@ -35,6 +35,10 @@ type Camera struct {
 func DiscoverCamerasWithSettings(s Settings) ([]Camera, error) {
 	log.Println("[Discovery] Starting camera discovery...")
 	var cameras []Camera
+	maxCameras := s.MaxCameras
+	if maxCameras <= 0 {
+		maxCameras = DefaultMaxCameras
+	}
 
 	// Use v4l2-ctl to get actual video capture devices
 	cmd := exec.Command("v4l2-ctl", "--list-devices")
@@ -91,9 +95,9 @@ func DiscoverCamerasWithSettings(s Settings) ([]Camera, error) {
 		}
 	}
 
-	// Limit to 3 cameras
-	if len(devicePaths) > 3 {
-		devicePaths = devicePaths[:3]
+	// Limit to configured number of cameras
+	if len(devicePaths) > maxCameras {
+		devicePaths = devicePaths[:maxCameras]
 	}
 
 	numCameras := len(devicePaths)
@@ -313,9 +317,17 @@ func getOptimalFPS(cameraMaxFPS int, numCameras int, s Settings) int {
 func discoverCamerasSimple(s Settings) ([]Camera, error) {
 	var cameras []Camera
 	var devicePaths []string
+	maxCameras := s.MaxCameras
+	if maxCameras <= 0 {
+		maxCameras = DefaultMaxCameras
+	}
 
 	// First pass: find devices
-	for _, num := range []int{0, 2, 4} {
+	maxScan := maxCameras*4 + 4
+	if maxScan < 10 {
+		maxScan = 10
+	}
+	for num := 0; num <= maxScan; num += 2 {
 		devicePath := fmt.Sprintf("/dev/video%d", num)
 
 		// Check if device exists
@@ -335,7 +347,7 @@ func discoverCamerasSimple(s Settings) ([]Camera, error) {
 			devicePaths = append(devicePaths, devicePath)
 		}
 
-		if len(devicePaths) >= 3 {
+		if len(devicePaths) >= maxCameras {
 			break
 		}
 	}
@@ -345,7 +357,7 @@ func discoverCamerasSimple(s Settings) ([]Camera, error) {
 	// Second pass: create cameras with capabilities
 	for i, devicePath := range devicePaths {
 		cam := Camera{
-			DeviceID:   fmt.Sprintf("video%d", i*2),
+			DeviceID:   filepath.Base(devicePath),
 			DevicePath: devicePath,
 			Name:       fmt.Sprintf("Camera %d", i+1),
 			Available:  true,

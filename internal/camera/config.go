@@ -9,27 +9,30 @@ package camera
 
 // Default values (used when no config is provided)
 const (
-	DefaultWidth  = 640
-	DefaultHeight = 480
-	DefaultFPS    = 15
-	DefaultFormat = "mjpeg"
+	DefaultWidth      = 640
+	DefaultHeight     = 480
+	DefaultFPS        = 25
+	DefaultFormat     = "mjpeg"
+	DefaultMaxCameras = 3
 )
 
 // Settings holds camera capture configuration.
 // Populated from config.Config at startup and passed to the Manager.
 type Settings struct {
-	Width  int    // Capture width in pixels
-	Height int    // Capture height in pixels
-	FPS    int    // Target frames per second
-	Format string // Capture format: "mjpeg" or "yuyv"
+	Width      int    // Capture width in pixels
+	Height     int    // Capture height in pixels
+	FPS        int    // Target frames per second
+	Format     string // Capture format: "mjpeg" or "yuyv"
+	MaxCameras int    // Maximum number of cameras to discover/use
 }
 
 // DefaultSettings returns sensible defaults for vehicle camera monitoring.
 func DefaultSettings() Settings {
 	return Settings{
-		Width:  DefaultWidth,
-		Height: DefaultHeight,
-		FPS:    DefaultFPS,
-		Format: DefaultFormat,
+		Width:      DefaultWidth,
+		Height:     DefaultHeight,
+		FPS:        DefaultFPS,
+		Format:     DefaultFormat,
+		MaxCameras: DefaultMaxCameras,
 	}
 }

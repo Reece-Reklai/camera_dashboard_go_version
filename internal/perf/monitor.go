@@ -3,6 +3,7 @@ package perf
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,7 +48,23 @@ func (m *Monitor) UpdateStats() error {
 	return nil
 }
 
-// updateLoadAverage reads system load average
+// normalizeLoadAverage converts absolute 1-minute load average to
+// the Python-style normalized ratio (load / cpuCount), capped at 1.0.
+func normalizeLoadAverage(load1 float64, cpuCount int) float64 {
+	if cpuCount <= 0 {
+		cpuCount = 1
+	}
+	ratio := load1 / float64(cpuCount)
+	if ratio < 0 {
+		return 0
+	}
+	if ratio > 1.0 {
+		return 1.0
+	}
+	return ratio
+}
+
+// updateLoadAverage reads system load average.
 func (m *Monitor) updateLoadAverage() error {
 	data, err := os.ReadFile("/proc/loadavg")
 	if err != nil {
@@ -59,10 +76,11 @@ func (m *Monitor) updateLoadAverage() error {
 		return ErrInvalidLoadAverage
 	}
 
-	m.loadAvg, err = strconv.ParseFloat(fields[0], 64)
+	load1, err := strconv.ParseFloat(fields[0], 64)
 	if err != nil {
 		return err
 	}
+	m.loadAvg = normalizeLoadAverage(load1, runtime.NumCPU())
 
 	return nil
 }
@@ -156,7 +174,7 @@ func (m *Monitor) updateMemoryUsage() error {
 func (m *Monitor) IsUnderStress() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.loadAvg > 1.5 || m.temperature > 70.0
+	return m.loadAvg >= 0.75 || m.temperature >= 75.0
 }
 
 // Errors

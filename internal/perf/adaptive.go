@@ -27,10 +27,11 @@ const (
 	TempCritical = 86.0 // Emergency minimum FPS (throttling imminent)
 )
 
-// Load thresholds (Pi5 has 4 cores)
+// Load thresholds on normalized load ratio (0.0-1.0).
+// Monitor normalizes 1-minute load average by CPU count.
 const (
-	LoadIdeal = 2.5 // Comfortable load
-	LoadHigh  = 3.8 // High but not overloaded
+	LoadIdeal = 0.55 // Comfortable load
+	LoadHigh  = 0.85 // High load
 )
 
 // FPS limits - fallbacks if config is nil

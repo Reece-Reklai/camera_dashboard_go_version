@@ -24,32 +24,37 @@ import (
 	"time"
 )
 
+const holdThreshold = 400 * time.Millisecond
+const defaultBrightnessPercent = 100
+const defaultReconnectDebounce = 3 * time.Second
+
 // App represents the main camera dashboard application
 type App struct {
-	fyneApp fyne.App
-	window  fyne.Window
-	manager *camera.Manager
-	cameras []camera.Camera
-	cfg     *config.Config
+	fyneApp     fyne.App
+	window      fyne.Window
+	manager     *camera.Manager
+	cameras     []camera.Camera
+	cfg         *config.Config
+	cameraSlots int
 
-	// Grid positions (4 slots: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right)
-	// Each slot can contain: -1 = settings, 0-2 = camera index
-	gridSlots [4]int // What content is in each grid position
+	// Grid positions: index 0 is settings, index 1..N are camera slots.
+	// Each entry value is: -1 = settings, >=0 = camera index.
+	gridSlots []int
 
 	// Camera display
-	cameraImages  [3]*canvas.Image
-	cameraFrames  [3]image.Image
-	cameraWidgets [3]*TappableImage // References to camera TappableImage widgets
-	cameraStatus  [3]bool           // true = connected, false = disconnected
-	lastFrameRead [3]uint64         // Last frame timestamp read from each buffer
-	frameLock     sync.RWMutex      // Protects cameras, cameraFrames, cameraStatus, lastFrameTime
+	cameraImages  []*canvas.Image
+	cameraFrames  []image.Image
+	cameraWidgets []*TappableImage // References to camera TappableImage widgets
+	cameraStatus  []bool           // true = connected, false = disconnected
+	lastFrameRead []uint64         // Last frame timestamp read from each buffer
+	frameLock     sync.RWMutex     // Protects cameras, cameraFrames, cameraStatus, lastFrameTime
 
-	// All 4 grid widgets (for highlighting during swap)
-	gridWidgets [4]Highlightable
+	// All grid widgets (for highlighting during swap). Index 0 is settings.
+	gridWidgets []Highlightable
 
 	// UI state
 	swapMode          bool
-	swapSourceSlot    int // Grid position (0-3)
+	swapSourceSlot    int // Grid position (0..len(gridWidgets)-1)
 	isFullscreen      atomic.Bool
 	fullscreenSlot    int
 	fullscreenImg     *canvas.Image
@@ -64,19 +69,25 @@ type App struct {
 	hotplugStopCh      chan struct{}
 	reinitInProgress   bool // Prevents concurrent reinitializations
 	reinitLock         sync.Mutex
-	lastDisconnectTime [3]time.Time // Per-camera debounce tracking
-	cleanupOnce        sync.Once    // Prevents double close of hotplugStopCh
+	lastDisconnectTime []time.Time // Per-camera debounce tracking
+	failedNewDevice    map[string]time.Time
+	cleanupOnce        sync.Once // Prevents double close of hotplugStopCh
 
 	// Stale frame detection + bounded auto-restart
-	lastFrameTime   [3]time.Time   // When each camera last produced a frame
-	restartEvents   [3][]time.Time // Sliding window of restart timestamps
-	lastRestartTime [3]time.Time   // Last restart timestamp per camera
-	restartLimitHit [3]bool        // Whether restart limit was reached
+	lastFrameTime   []time.Time   // When each camera last produced a frame
+	restartEvents   [][]time.Time // Sliding window of restart timestamps
+	lastRestartTime []time.Time   // Last restart timestamp per camera
+	restartLimitHit []bool        // Whether restart limit was reached
 
 	// Night mode
 	nightModeEnabled atomic.Bool
-	nightModeBufs    [3]*image.RGBA // Reusable buffers for night mode (one per camera slot)
-	nightModeFSBuf   *image.RGBA    // Reusable buffer for fullscreen night mode
+	nightModeBufs    []*image.RGBA // Reusable buffers for night mode (one per camera slot)
+	nightModeFSBuf   *image.RGBA   // Reusable buffer for fullscreen night mode
+
+	// Brightness (Python parity: 15/60/80/100/150% presets from settings tile)
+	brightnessPercent atomic.Int32
+	brightnessBufs    []*image.RGBA // Reusable buffers for brightness filter (per camera slot)
+	brightnessFSBuf   *image.RGBA   // Reusable buffer for fullscreen brightness filter
 
 	// Performance management
 	perfController *perf.AdaptiveController
@@ -92,6 +103,13 @@ func NewApp(cfg *config.Config) *App {
 	if cfg == nil {
 		cfg = config.DefaultConfig()
 	}
+	slots := cfg.CameraSlotCount
+	if slots < 1 {
+		slots = 1
+	}
+	if slots > 8 {
+		slots = 8
+	}
 
 	fyneApp := app.New()
 	window := fyneApp.NewWindow("Camera Dashboard - Go")
@@ -100,31 +118,40 @@ func NewApp(cfg *config.Config) *App {
 	window.SetFullScreen(true)
 
 	a := &App{
-		fyneApp:        fyneApp,
-		window:         window,
-		cfg:            cfg,
-		swapSourceSlot: -1,
-		hotplugStopCh:  make(chan struct{}),
+		fyneApp:         fyneApp,
+		window:          window,
+		cfg:             cfg,
+		cameraSlots:     slots,
+		swapSourceSlot:  -1,
+		hotplugStopCh:   make(chan struct{}),
+		failedNewDevice: make(map[string]time.Time),
 	}
+	a.brightnessPercent.Store(defaultBrightnessPercent)
 
-	// Initialize grid slot assignments:
-	// Slot 0 (top-left) = -1 (settings)
-	// Slot 1 (top-right) = 0 (camera 0)
-	// Slot 2 (bottom-left) = 1 (camera 1)
-	// Slot 3 (bottom-right) = 2 (camera 2 / placeholder)
+	totalSlots := slots + 1 // settings + camera slots
+	a.gridSlots = make([]int, totalSlots)
+	a.gridWidgets = make([]Highlightable, totalSlots)
+	a.cameraImages = make([]*canvas.Image, slots)
+	a.cameraFrames = make([]image.Image, slots)
+	a.cameraWidgets = make([]*TappableImage, slots)
+	a.cameraStatus = make([]bool, slots)
+	a.lastFrameRead = make([]uint64, slots)
+	a.lastDisconnectTime = make([]time.Time, slots)
+	a.lastFrameTime = make([]time.Time, slots)
+	a.restartEvents = make([][]time.Time, slots)
+	a.lastRestartTime = make([]time.Time, slots)
+	a.restartLimitHit = make([]bool, slots)
+	a.nightModeBufs = make([]*image.RGBA, slots)
+	a.brightnessBufs = make([]*image.RGBA, slots)
+
 	a.gridSlots[0] = -1 // Settings
-	a.gridSlots[1] = 0  // Camera 0
-	a.gridSlots[2] = 1  // Camera 1
-	a.gridSlots[3] = 2  // Camera 2 (placeholder)
-
-	// Initialize all cameras as disconnected initially
-	a.cameraStatus[0] = false
-	a.cameraStatus[1] = false
-	a.cameraStatus[2] = false
+	for i := 0; i < slots; i++ {
+		a.gridSlots[i+1] = i
+	}
 
 	// Create camera images
 	bgColor := color.RGBA{25, 25, 25, 255}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < slots; i++ {
 		placeholder := createColoredImage(400, 240, bgColor)
 		a.cameraFrames[i] = placeholder
 		a.cameraImages[i] = canvas.NewImageFromImage(placeholder)
@@ -154,6 +181,50 @@ func createColoredImage(width, height int, c color.Color) image.Image {
 		copy(img.Pix[y*stride:(y+1)*stride], firstRow)
 	}
 	return img
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (a *App) effectiveSlots() int {
+	return a.cameraSlots
+}
+
+func (a *App) currentUIFPS() int {
+	base := a.cfg.UIFPS
+	if base <= 0 {
+		base = 20
+	}
+
+	if a.perfController == nil || !a.cfg.DynamicFPSEnabled {
+		return base
+	}
+
+	curCapture := a.perfController.GetCurrentFPS()
+	baseCapture := a.cfg.CaptureFPS
+	if baseCapture <= 0 {
+		baseCapture = 1
+	}
+
+	scaled := int(float64(base) * float64(curCapture) / float64(baseCapture))
+	if scaled < a.cfg.MinDynamicUIFPS {
+		scaled = a.cfg.MinDynamicUIFPS
+	}
+	if scaled > base {
+		scaled = base
+	}
+	return scaled
 }
 
 func (a *App) Start() {
@@ -264,8 +335,8 @@ func (t *TappableImage) MouseDown(ev *desktop.MouseEvent) {
 		t.longPressTimer.Stop()
 	}
 
-	// Start long-press timer (500ms)
-	t.longPressTimer = time.AfterFunc(500*time.Millisecond, func() {
+	// Start long-press timer (Python parity: 400ms)
+	t.longPressTimer = time.AfterFunc(holdThreshold, func() {
 		t.mu.Lock()
 		t.longPressFired = true
 		t.tapHandled = true // Don't fire tap after long press
@@ -332,26 +403,34 @@ func (t *TappableImage) TappedSecondary(_ *fyne.PointEvent) {
 // TappableSettings is the settings widget with swap support
 type TappableSettings struct {
 	widget.BaseWidget
-	bg             *canvas.Rectangle
-	border         *canvas.Rectangle
-	content        *fyne.Container
-	nightModeBtn   *widget.Button
-	onTap          func()
-	onLongTap      func()
-	pressStart     time.Time
-	longPressTimer *time.Timer
-	longPressFired bool
-	tapHandled     bool
-	highlighted    bool
-	mu             sync.Mutex
+	bg                *canvas.Rectangle
+	border            *canvas.Rectangle
+	content           *fyne.Container
+	nightModeBtn      *widget.Button
+	brightnessButtons map[int]*widget.Button
+	currentBrightness int
+	onTap             func()
+	onLongTap         func()
+	pressStart        time.Time
+	longPressTimer    *time.Timer
+	longPressFired    bool
+	tapHandled        bool
+	highlighted       bool
+	mu                sync.Mutex
 }
 
-func NewTappableSettings(onRestart, onExit, onNightModeToggle, onTap, onLongTap func()) *TappableSettings {
+func NewTappableSettings(
+	onRestart, onExit, onNightModeToggle func(),
+	onBrightnessChange func(int),
+	onTap, onLongTap func(),
+) *TappableSettings {
 	t := &TappableSettings{
-		bg:        canvas.NewRectangle(color.RGBA{50, 50, 55, 255}),
-		border:    canvas.NewRectangle(color.Transparent),
-		onTap:     onTap,
-		onLongTap: onLongTap,
+		bg:                canvas.NewRectangle(color.RGBA{50, 50, 55, 255}),
+		border:            canvas.NewRectangle(color.Transparent),
+		brightnessButtons: make(map[int]*widget.Button),
+		currentBrightness: defaultBrightnessPercent,
+		onTap:             onTap,
+		onLongTap:         onLongTap,
 	}
 	t.border.StrokeWidth = 4
 	t.border.StrokeColor = color.Transparent
@@ -374,7 +453,30 @@ func NewTappableSettings(onRestart, onExit, onNightModeToggle, onTap, onLongTap 
 		}
 	})
 
-	t.content = container.NewCenter(container.NewVBox(restartBtn, t.nightModeBtn, exitBtn))
+	brightnessLabel := widget.NewLabel("Brightness")
+	brightnessLabel.Alignment = fyne.TextAlignCenter
+
+	brightnessRow := container.NewGridWithColumns(5)
+	for _, pct := range []int{15, 60, 80, 100, 150} {
+		pctCopy := pct
+		btn := widget.NewButton(fmt.Sprintf("%d%%", pct), func() {
+			t.SetBrightnessSelection(pctCopy)
+			if onBrightnessChange != nil {
+				onBrightnessChange(pctCopy)
+			}
+		})
+		t.brightnessButtons[pct] = btn
+		brightnessRow.Add(btn)
+	}
+	t.SetBrightnessSelection(defaultBrightnessPercent)
+
+	t.content = container.NewCenter(container.NewVBox(
+		restartBtn,
+		t.nightModeBtn,
+		brightnessLabel,
+		brightnessRow,
+		exitBtn,
+	))
 	t.ExtendBaseWidget(t)
 	return t
 }
@@ -388,6 +490,22 @@ func (t *TappableSettings) SetNightModeLabel(enabled bool) {
 		t.nightModeBtn.SetText("Nightmode: On")
 	} else {
 		t.nightModeBtn.SetText("Nightmode: Off")
+	}
+}
+
+// SetBrightnessSelection updates which brightness preset appears selected.
+func (t *TappableSettings) SetBrightnessSelection(percent int) {
+	t.mu.Lock()
+	t.currentBrightness = percent
+	t.mu.Unlock()
+
+	for value, btn := range t.brightnessButtons {
+		if value == percent {
+			btn.Importance = widget.HighImportance
+		} else {
+			btn.Importance = widget.MediumImportance
+		}
+		btn.Refresh()
 	}
 }
 
@@ -421,7 +539,7 @@ func (t *TappableSettings) MouseDown(ev *desktop.MouseEvent) {
 		t.longPressTimer.Stop()
 	}
 
-	t.longPressTimer = time.AfterFunc(500*time.Millisecond, func() {
+	t.longPressTimer = time.AfterFunc(holdThreshold, func() {
 		t.mu.Lock()
 		t.longPressFired = true
 		t.tapHandled = true
@@ -479,7 +597,7 @@ func (a *App) setupUI() {
 	// Dark background
 	background := canvas.NewRectangle(color.RGBA{20, 20, 20, 255})
 
-	// Settings widget with Restart/Night Mode/Exit buttons and swap support
+	// Settings widget with Restart/Night Mode/Brightness/Exit controls and swap support
 	var settingsWidget *TappableSettings
 	settingsWidget = NewTappableSettings(
 		func() {
@@ -494,51 +612,38 @@ func (a *App) setupUI() {
 			a.toggleNightMode()
 			settingsWidget.SetNightModeLabel(a.nightModeEnabled.Load())
 		},
+		func(percent int) {
+			a.setBrightness(percent)
+			settingsWidget.SetBrightnessSelection(percent)
+		},
 		func() { a.onWidgetTap(settingsWidget) },
 		func() { a.onWidgetLongPress(settingsWidget) },
 	)
+	settingsWidget.SetBrightnessSelection(a.getBrightnessPercent())
 	a.gridWidgets[0] = settingsWidget
 
 	// Camera widgets with tap handlers
-	var cam1, cam2, cam3 *TappableImage
+	gridObjects := make([]fyne.CanvasObject, 0, a.effectiveSlots()+1)
+	gridObjects = append(gridObjects, settingsWidget)
 
-	cam1 = NewTappableImage(
-		a.cameraImages[0],
-		color.RGBA{25, 25, 25, 255},
-		func() { a.onWidgetTap(cam1) },
-		func() { a.onWidgetLongPress(cam1) },
-	)
-	a.gridWidgets[1] = cam1
-	a.cameraWidgets[0] = cam1
-	cam1.SetDisconnected(true) // Start disconnected until camera detected
-
-	cam2 = NewTappableImage(
-		a.cameraImages[1],
-		color.RGBA{25, 25, 25, 255},
-		func() { a.onWidgetTap(cam2) },
-		func() { a.onWidgetLongPress(cam2) },
-	)
-	a.gridWidgets[2] = cam2
-	a.cameraWidgets[1] = cam2
-	cam2.SetDisconnected(true) // Start disconnected until camera detected
-
-	cam3 = NewTappableImage(
-		a.cameraImages[2],
-		color.RGBA{25, 25, 25, 255},
-		func() { a.onWidgetTap(cam3) },
-		func() { a.onWidgetLongPress(cam3) },
-	)
-	a.gridWidgets[3] = cam3
-	a.cameraWidgets[2] = cam3
-	cam3.SetDisconnected(true) // Start disconnected until camera detected
+	for i := 0; i < a.effectiveSlots(); i++ {
+		index := i
+		var camWidget *TappableImage
+		camWidget = NewTappableImage(
+			a.cameraImages[index],
+			color.RGBA{25, 25, 25, 255},
+			func() { a.onWidgetTap(camWidget) },
+			func() { a.onWidgetLongPress(camWidget) },
+		)
+		a.gridWidgets[index+1] = camWidget
+		a.cameraWidgets[index] = camWidget
+		camWidget.SetDisconnected(true) // Start disconnected until camera detected
+		gridObjects = append(gridObjects, camWidget)
+	}
 
 	// Dynamic grid layout based on number of widgets (settings + cameras)
-	totalSlots := 1 + a.cfg.CameraSlotCount // 1 settings panel + N camera slots
-	gridRows, gridCols := helpers.GetSmartGrid(totalSlots)
-	a.grid = container.New(&fillGridLayout{rows: gridRows, cols: gridCols},
-		settingsWidget, cam1,
-		cam2, cam3,
-	)
+	gridRows, gridCols := helpers.GetSmartGrid(len(gridObjects))
+	a.grid = container.New(&fillGridLayout{rows: gridRows, cols: gridCols}, gridObjects...)
 
 	// Prepare fullscreen image (reused) - use Stretch to fill screen
 	a.fullscreenImg = canvas.NewImageFromImage(createColoredImage(800, 480, color.RGBA{0, 0, 0, 255}))
@@ -596,6 +701,9 @@ func (g *fillGridLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
 
 // onGridTap handles tap on any grid position (0-3)
 func (a *App) onGridTap(gridPos int) {
+	if gridPos < 0 || gridPos >= len(a.gridSlots) {
+		return
+	}
 	log.Printf("[UI] Grid tap on position %d, swapMode=%v", gridPos, a.swapMode)
 
 	if a.swapMode {
@@ -607,6 +715,9 @@ func (a *App) onGridTap(gridPos int) {
 
 // onGridLongPress handles long-press on any grid position (0-3)
 func (a *App) onGridLongPress(gridPos int) {
+	if gridPos < 0 || gridPos >= len(a.gridSlots) {
+		return
+	}
 	log.Printf("[UI] Long press on grid position %d", gridPos)
 	a.swapMode = true
 	a.swapSourceSlot = gridPos
@@ -621,7 +732,7 @@ func (a *App) onGridLongPress(gridPos int) {
 
 // findWidgetPosition finds the current grid position of a widget
 func (a *App) findWidgetPosition(widget Highlightable) int {
-	for i := 0; i < 4; i++ {
+	for i := 0; i < len(a.gridWidgets); i++ {
 		if a.gridWidgets[i] == widget {
 			return i
 		}
@@ -670,7 +781,7 @@ func (a *App) handleSwapTap(gridPos int) {
 		a.swapGridPositions(a.swapSourceSlot, gridPos)
 
 		// Clear all highlights and exit swap mode
-		for i := 0; i < 4; i++ {
+		for i := 0; i < len(a.gridWidgets); i++ {
 			if a.gridWidgets[i] != nil {
 				a.gridWidgets[i].SetHighlight(false)
 			}
@@ -683,6 +794,9 @@ func (a *App) handleSwapTap(gridPos int) {
 
 // swapGridPositions swaps the content assignments of two grid positions
 func (a *App) swapGridPositions(pos1, pos2 int) {
+	if pos1 < 0 || pos2 < 0 || pos1 >= len(a.gridSlots) || pos2 >= len(a.gridSlots) {
+		return
+	}
 	log.Printf("[UI] Swapping grid positions %d and %d", pos1, pos2)
 
 	// Swap the content assignments
@@ -690,6 +804,9 @@ func (a *App) swapGridPositions(pos1, pos2 int) {
 
 	// Swap the actual widgets in the grid
 	objects := a.grid.Objects
+	if pos1 >= len(objects) || pos2 >= len(objects) {
+		return
+	}
 	objects[pos1], objects[pos2] = objects[pos2], objects[pos1]
 
 	// Swap widget references
@@ -701,6 +818,9 @@ func (a *App) swapGridPositions(pos1, pos2 int) {
 
 func (a *App) showFullscreen(gridPos int) {
 	if a.isFullscreen.Load() {
+		return
+	}
+	if gridPos < 0 || gridPos >= len(a.gridSlots) {
 		return
 	}
 
@@ -733,10 +853,7 @@ func (a *App) showFullscreen(gridPos int) {
 	a.frameLock.RUnlock()
 
 	if currentFrame != nil {
-		displayFrame := currentFrame
-		if a.nightModeEnabled.Load() {
-			displayFrame = applyNightMode(currentFrame)
-		}
+		displayFrame := a.applyFullscreenFilters(currentFrame)
 		a.fullscreenImg.Image = displayFrame
 		a.fullscreenImg.Refresh()
 	}
@@ -779,37 +896,33 @@ func (a *App) hideFullscreen() {
 }
 
 func (a *App) updateFullscreenLoop(camIndex int, stopCh chan struct{}) {
-	uiFPS := a.cfg.UIFPS
-	if uiFPS <= 0 {
-		uiFPS = 15
-	}
-	ticker := time.NewTicker(time.Second / time.Duration(uiFPS))
-	defer ticker.Stop()
-
 	for {
+		if !a.isFullscreen.Load() {
+			return
+		}
+
+		a.frameLock.RLock()
+		var frame image.Image
+		if camIndex >= 0 && camIndex < len(a.cameraFrames) {
+			frame = a.cameraFrames[camIndex]
+		}
+		a.frameLock.RUnlock()
+
+		if frame != nil && a.fullscreenImg != nil {
+			displayFrame := a.applyFullscreenFilters(frame)
+			a.fullscreenImg.Image = displayFrame
+			a.fullscreenImg.Refresh()
+		}
+
+		uiFPS := a.currentUIFPS()
+		if uiFPS < 1 {
+			uiFPS = 1
+		}
+		wait := time.Second / time.Duration(uiFPS)
 		select {
 		case <-stopCh:
 			return
-		case <-ticker.C:
-			if !a.isFullscreen.Load() {
-				return
-			}
-
-			a.frameLock.RLock()
-			frame := a.cameraFrames[camIndex]
-			a.frameLock.RUnlock()
-
-			if frame != nil && a.fullscreenImg != nil {
-				// Apply night mode filter if enabled
-				displayFrame := frame
-				if a.nightModeEnabled.Load() {
-					a.nightModeFSBuf = applyNightModeReuse(frame, a.nightModeFSBuf)
-					displayFrame = a.nightModeFSBuf
-				}
-
-				a.fullscreenImg.Image = displayFrame
-				a.fullscreenImg.Refresh()
-			}
+		case <-time.After(wait):
 		}
 	}
 }
@@ -825,7 +938,8 @@ func (a *App) initializeCamerasAsync() {
 
 	// Kill any processes holding camera devices (e.g., stale FFmpeg from previous run)
 	if a.cfg.KillDeviceHolders {
-		for _, devNum := range []int{0, 2, 4, 6, 8, 10} {
+		maxScan := maxInt(10, a.effectiveSlots()*4+4)
+		for devNum := 0; devNum <= maxScan; devNum += 2 {
 			devPath := fmt.Sprintf("/dev/video%d", devNum)
 			if _, err := os.Stat(devPath); err == nil {
 				helpers.KillDeviceHolders(devPath, true)
@@ -835,10 +949,11 @@ func (a *App) initializeCamerasAsync() {
 
 	// Use buffer mode for decoupled capture/render with config-driven settings
 	a.manager = camera.NewManagerWithSettings(camera.Settings{
-		Width:  a.cfg.CaptureWidth,
-		Height: a.cfg.CaptureHeight,
-		FPS:    a.cfg.CaptureFPS,
-		Format: a.cfg.CaptureFormat,
+		Width:      a.cfg.CaptureWidth,
+		Height:     a.cfg.CaptureHeight,
+		FPS:        a.cfg.CaptureFPS,
+		Format:     a.cfg.CaptureFormat,
+		MaxCameras: a.effectiveSlots(),
 	}, true)
 
 	if err := a.manager.Initialize(); err != nil {
@@ -856,11 +971,14 @@ func (a *App) initializeCamerasAsync() {
 	a.frameLock.Lock()
 	a.cameras = cams
 	a.frameLock.Unlock()
+	for i := 0; i < a.effectiveSlots(); i++ {
+		a.updateCameraStatus(i, false)
+	}
 	log.Printf("[UI] Discovered %d cameras", len(cams))
 	for i, cam := range cams {
 		log.Printf("[UI]   - %s: %s", cam.DeviceID, cam.DevicePath)
 		// Mark camera as connected and update UI
-		if i < 3 {
+		if i < a.effectiveSlots() {
 			a.updateCameraStatus(i, true)
 		}
 	}
@@ -871,25 +989,25 @@ func (a *App) initializeCamerasAsync() {
 
 func (a *App) startCameraRefresh() {
 	go func() {
-		// UI refresh rate from config
-		uiFPS := a.cfg.UIFPS
-		if uiFPS <= 0 {
-			uiFPS = 30
-		}
-		refreshInterval := time.Second / time.Duration(uiFPS)
-		ticker := time.NewTicker(refreshInterval)
-		defer ticker.Stop()
-
 		frameCounters := make(map[string]uint64)
 
 		for {
 			select {
 			case <-a.hotplugStopCh:
 				return
-			case <-ticker.C:
+			default:
 			}
 
 			if a.manager == nil {
+				uiFPS := a.currentUIFPS()
+				if uiFPS < 1 {
+					uiFPS = 1
+				}
+				select {
+				case <-a.hotplugStopCh:
+					return
+				case <-time.After(time.Second / time.Duration(uiFPS)):
+				}
 				continue
 			}
 
@@ -899,12 +1017,8 @@ func (a *App) startCameraRefresh() {
 			copy(cameras, a.cameras)
 			a.frameLock.RUnlock()
 
-			if camCount == 0 {
-				continue
-			}
-
-			// Update each camera's image (camera indices 0, 1, 2)
-			for camIndex := 0; camIndex < 3 && camIndex < camCount; camIndex++ {
+			slotLimit := minInt(a.effectiveSlots(), camCount)
+			for camIndex := 0; camIndex < slotLimit; camIndex++ {
 				cameraID := cameras[camIndex].DeviceID
 
 				// Try buffer mode first (preferred)
@@ -927,12 +1041,7 @@ func (a *App) startCameraRefresh() {
 				a.lastFrameTime[camIndex] = time.Now()
 				a.frameLock.Unlock()
 
-				// Apply night mode filter if enabled
-				displayFrame := frame
-				if a.nightModeEnabled.Load() {
-					a.nightModeBufs[camIndex] = applyNightModeReuse(frame, a.nightModeBufs[camIndex])
-					displayFrame = a.nightModeBufs[camIndex]
-				}
+				displayFrame := a.applySlotFilters(camIndex, frame)
 
 				// Update the camera image widget
 				// Fyne's Refresh is thread-safe but can be slow if backed up
@@ -947,13 +1056,23 @@ func (a *App) startCameraRefresh() {
 						cameraID, frameCounters[cameraID], totalFrames, droppedCount, fps)
 				}
 			}
+
+			uiFPS := a.currentUIFPS()
+			if uiFPS < 1 {
+				uiFPS = 1
+			}
+			select {
+			case <-a.hotplugStopCh:
+				return
+			case <-time.After(time.Second / time.Duration(uiFPS)):
+			}
 		}
 	}()
 }
 
 // updateCameraStatus updates the connected/disconnected status for a camera slot
 func (a *App) updateCameraStatus(camIndex int, connected bool) {
-	if camIndex < 0 || camIndex >= 3 {
+	if camIndex < 0 || camIndex >= len(a.cameraStatus) {
 		return
 	}
 
@@ -975,6 +1094,66 @@ func (a *App) updateCameraStatus(camIndex int, connected bool) {
 // =============================================================================
 // Night Mode
 // =============================================================================
+
+func (a *App) getBrightnessPercent() int {
+	p := int(a.brightnessPercent.Load())
+	if p <= 0 {
+		return defaultBrightnessPercent
+	}
+	return p
+}
+
+func (a *App) setBrightness(percent int) {
+	switch percent {
+	case 15, 60, 80, 100, 150:
+		// Valid preset
+	default:
+		log.Printf("[UI] Ignoring unsupported brightness preset: %d%%", percent)
+		return
+	}
+
+	prev := a.brightnessPercent.Swap(int32(percent))
+	if prev != int32(percent) {
+		log.Printf("[UI] Brightness set to %d%%", percent)
+	}
+}
+
+func (a *App) applySlotFilters(camIndex int, frame image.Image) image.Image {
+	if camIndex < 0 || camIndex >= len(a.nightModeBufs) || camIndex >= len(a.brightnessBufs) {
+		return frame
+	}
+	displayFrame := frame
+
+	if a.nightModeEnabled.Load() {
+		a.nightModeBufs[camIndex] = applyNightModeReuse(displayFrame, a.nightModeBufs[camIndex])
+		displayFrame = a.nightModeBufs[camIndex]
+	}
+
+	brightness := a.getBrightnessPercent()
+	if brightness != defaultBrightnessPercent {
+		a.brightnessBufs[camIndex] = applyBrightnessPercentReuse(displayFrame, brightness, a.brightnessBufs[camIndex])
+		displayFrame = a.brightnessBufs[camIndex]
+	}
+
+	return displayFrame
+}
+
+func (a *App) applyFullscreenFilters(frame image.Image) image.Image {
+	displayFrame := frame
+
+	if a.nightModeEnabled.Load() {
+		a.nightModeFSBuf = applyNightModeReuse(displayFrame, a.nightModeFSBuf)
+		displayFrame = a.nightModeFSBuf
+	}
+
+	brightness := a.getBrightnessPercent()
+	if brightness != defaultBrightnessPercent {
+		a.brightnessFSBuf = applyBrightnessPercentReuse(displayFrame, brightness, a.brightnessFSBuf)
+		displayFrame = a.brightnessFSBuf
+	}
+
+	return displayFrame
+}
 
 // toggleNightMode toggles the night mode state and logs the change.
 func (a *App) toggleNightMode() {
@@ -1033,7 +1212,8 @@ func (a *App) logHealthSummary() {
 	disconnected := 0
 	totalSlots := a.cfg.CameraSlotCount
 
-	for camIndex := 0; camIndex < totalSlots && camIndex < 3; camIndex++ {
+	limit := minInt(totalSlots, len(a.cameraStatus))
+	for camIndex := 0; camIndex < limit; camIndex++ {
 		a.frameLock.RLock()
 		connected := a.cameraStatus[camIndex]
 		lastFrame := a.lastFrameTime[camIndex]
@@ -1110,7 +1290,8 @@ func (a *App) checkStaleFrames() {
 	now := time.Now()
 	staleTimeout := time.Duration(a.cfg.StaleFrameTimeoutSec * float64(time.Second))
 
-	for camIndex := 0; camIndex < 3 && camIndex < camCount; camIndex++ {
+	limit := minInt(a.effectiveSlots(), camCount)
+	for camIndex := 0; camIndex < limit; camIndex++ {
 		a.frameLock.RLock()
 		connected := a.cameraStatus[camIndex]
 		lastFrame := a.lastFrameTime[camIndex]
@@ -1148,6 +1329,9 @@ func (a *App) checkStaleFrames() {
 //   - Sliding window restart limit (MAX_RESTARTS_PER_WINDOW in RESTART_WINDOW_SEC)
 //   - Extended cooldown (2x window) when limit is reached
 func (a *App) restartCaptureIfStale(camIndex int) {
+	if camIndex < 0 || camIndex >= len(a.lastRestartTime) || camIndex >= len(a.restartEvents) || camIndex >= len(a.restartLimitHit) {
+		return
+	}
 	now := time.Now()
 	cooldown := time.Duration(a.cfg.RestartCooldownSec * float64(time.Second))
 	window := time.Duration(a.cfg.RestartWindowSec * float64(time.Second))
@@ -1235,7 +1419,11 @@ func (a *App) restartCaptureIfStale(camIndex int) {
 func (a *App) startHotplugDetection() {
 	log.Println("[Hotplug] Starting camera hot-plug detection...")
 
-	ticker := time.NewTicker(2 * time.Second) // Poll every 2 seconds
+	interval := time.Duration(a.cfg.RescanIntervalMS) * time.Millisecond
+	if interval < 500*time.Millisecond {
+		interval = 500 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -1256,16 +1444,13 @@ func (a *App) checkCameraChanges() {
 	a.frameLock.RLock()
 	cameras := make([]camera.Camera, len(a.cameras))
 	copy(cameras, a.cameras)
-	var statusSnapshot [3]bool
-	for i := 0; i < 3 && i < len(cameras); i++ {
-		statusSnapshot[i] = a.cameraStatus[i]
-	}
+	statusSnapshot := make([]bool, len(a.cameraStatus))
+	copy(statusSnapshot, a.cameraStatus)
 	a.frameLock.RUnlock()
 
-	for i, cam := range cameras {
-		if i >= 3 {
-			break
-		}
+	limit := minInt(len(cameras), len(statusSnapshot))
+	for i := 0; i < limit; i++ {
+		cam := cameras[i]
 
 		// Check if device file still exists
 		_, err := os.Stat(cam.DevicePath)
@@ -1301,17 +1486,17 @@ func (a *App) checkForNewCameras() {
 	}
 	a.reinitLock.Unlock()
 
-	// Only check if we have empty slots (fewer than 3 connected cameras)
+	// Only check if we have empty slots.
 	connectedCount := 0
 	a.frameLock.RLock()
 	camCount := len(a.cameras)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < a.effectiveSlots(); i++ {
 		if i < camCount && a.cameraStatus[i] {
 			connectedCount++
 		}
 	}
 	a.frameLock.RUnlock()
-	if connectedCount >= 3 {
+	if connectedCount >= a.effectiveSlots() {
 		return // All slots full
 	}
 
@@ -1323,14 +1508,22 @@ func (a *App) checkForNewCameras() {
 	}
 	a.frameLock.RUnlock()
 
-	// Scan /dev/video* for potential new USB cameras
-	// USB cameras on Pi typically use even numbers (video0, video2, video4, etc.)
-	// Odd numbers (video1, video3, etc.) are usually metadata devices
-	for i := 0; i <= 10; i += 2 {
+	cooldown := time.Duration(a.cfg.FailedCameraCooldownS * float64(time.Second))
+	if cooldown < time.Second {
+		cooldown = time.Second
+	}
+	now := time.Now()
+	maxScan := maxInt(10, a.effectiveSlots()*4+4)
+
+	// Scan /dev/video* for potential new USB cameras.
+	for i := 0; i <= maxScan; i += 2 {
 		devPath := fmt.Sprintf("/dev/video%d", i)
 
 		if existingPaths[devPath] {
 			continue // Already tracking this device
+		}
+		if last, ok := a.failedNewDevice[devPath]; ok && now.Sub(last) < cooldown {
+			continue
 		}
 
 		// Check if device exists
@@ -1338,6 +1531,7 @@ func (a *App) checkForNewCameras() {
 			// Verify it's a USB camera by checking if it's a capture device
 			if a.isUSBCaptureDevice(devPath, existingPaths) {
 				log.Printf("[Hotplug] New USB camera detected at %s", devPath)
+				a.failedNewDevice[devPath] = now
 				a.handleNewCameraDevice(devPath)
 				return // Only handle one at a time
 			}
@@ -1424,7 +1618,7 @@ func (a *App) handleNewCameraDevice(devPath string) {
 	// Find an empty/disconnected slot
 	emptySlot := -1
 	a.frameLock.RLock()
-	for i := 0; i < 3; i++ {
+	for i := 0; i < a.effectiveSlots(); i++ {
 		if i >= len(a.cameras) || !a.cameraStatus[i] {
 			emptySlot = i
 			break
@@ -1460,10 +1654,11 @@ func (a *App) handleNewCameraDevice(devPath string) {
 
 		// Use buffer mode for decoupled capture/render with config-driven settings
 		a.manager = camera.NewManagerWithSettings(camera.Settings{
-			Width:  a.cfg.CaptureWidth,
-			Height: a.cfg.CaptureHeight,
-			FPS:    a.cfg.CaptureFPS,
-			Format: a.cfg.CaptureFormat,
+			Width:      a.cfg.CaptureWidth,
+			Height:     a.cfg.CaptureHeight,
+			FPS:        a.cfg.CaptureFPS,
+			Format:     a.cfg.CaptureFormat,
+			MaxCameras: a.effectiveSlots(),
 		}, true)
 		if err := a.manager.Initialize(); err != nil {
 			log.Printf("[Hotplug] Failed to reinitialize manager: %v", err)
@@ -1478,10 +1673,13 @@ func (a *App) handleNewCameraDevice(devPath string) {
 		a.frameLock.Lock()
 		a.cameras = cams
 		a.frameLock.Unlock()
+		for i := 0; i < a.effectiveSlots(); i++ {
+			a.updateCameraStatus(i, false)
+		}
 		log.Printf("[Hotplug] Reinitialized with %d cameras", len(cams))
 
 		for i := range cams {
-			if i < 3 {
+			if i < a.effectiveSlots() {
 				a.updateCameraStatus(i, true)
 			}
 		}
@@ -1491,13 +1689,22 @@ func (a *App) handleNewCameraDevice(devPath string) {
 // handleCameraReconnect handles a camera that was disconnected and is now reconnected
 // Uses per-camera restart to avoid disrupting other cameras
 func (a *App) handleCameraReconnect(camIndex int) {
-	// Debounce: ignore reconnects within 3 seconds of disconnect
+	// Debounce reconnect checks to avoid flapping on unstable USB links.
+	debounce := defaultReconnectDebounce
+	if cfgDelay := time.Duration(a.cfg.FailedCameraCooldownS * float64(time.Second)); cfgDelay > 0 && cfgDelay < debounce {
+		debounce = cfgDelay
+	}
+
 	a.reinitLock.Lock()
-	timeSinceDisconnect := time.Since(a.lastDisconnectTime[camIndex])
-	if timeSinceDisconnect < 3*time.Second {
+	if camIndex < 0 || camIndex >= len(a.lastDisconnectTime) {
 		a.reinitLock.Unlock()
-		log.Printf("[Hotplug] Camera %d: Ignoring reconnect (%.1fs since disconnect, need 3s debounce)",
-			camIndex, timeSinceDisconnect.Seconds())
+		return
+	}
+	timeSinceDisconnect := time.Since(a.lastDisconnectTime[camIndex])
+	if timeSinceDisconnect < debounce {
+		a.reinitLock.Unlock()
+		log.Printf("[Hotplug] Camera %d: Ignoring reconnect (%.1fs since disconnect, need %.1fs debounce)",
+			camIndex, timeSinceDisconnect.Seconds(), debounce.Seconds())
 		return
 	}
 

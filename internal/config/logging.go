@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -23,6 +24,63 @@ type RotatingFileWriter struct {
 	backupCount int
 	file        *os.File
 	currentSize int64
+}
+
+// Log levels for coarse filtering when using Go's standard log package.
+type LogLevel int
+
+const (
+	LevelDebug LogLevel = iota
+	LevelInfo
+	LevelWarning
+	LevelError
+	LevelCritical
+)
+
+func parseLogLevel(level string) LogLevel {
+	switch strings.ToUpper(strings.TrimSpace(level)) {
+	case "DEBUG":
+		return LevelDebug
+	case "INFO", "":
+		return LevelInfo
+	case "WARNING", "WARN":
+		return LevelWarning
+	case "ERROR":
+		return LevelError
+	case "CRITICAL":
+		return LevelCritical
+	default:
+		return LevelInfo
+	}
+}
+
+func detectMessageLevel(msg string) LogLevel {
+	upper := strings.ToUpper(msg)
+	switch {
+	case strings.Contains(upper, "CRITICAL"):
+		return LevelCritical
+	case strings.Contains(upper, "ERROR"):
+		return LevelError
+	case strings.Contains(upper, "WARNING"), strings.Contains(upper, "WARN"):
+		return LevelWarning
+	case strings.Contains(upper, "DEBUG"):
+		return LevelDebug
+	default:
+		// Most current logs are untagged; treat them as INFO.
+		return LevelInfo
+	}
+}
+
+type levelFilterWriter struct {
+	minLevel LogLevel
+	next     io.Writer
+}
+
+func (w *levelFilterWriter) Write(p []byte) (int, error) {
+	if detectMessageLevel(string(p)) < w.minLevel {
+		return len(p), nil
+	}
+	return w.next.Write(p)
 }
 
 // NewRotatingFileWriter creates a new rotating file writer.
@@ -149,6 +207,10 @@ func ConfigureLogging(cfg *Config) (cleanup func(), err error) {
 		w = writers[0]
 	} else {
 		w = io.MultiWriter(writers...)
+	}
+	w = &levelFilterWriter{
+		minLevel: parseLogLevel(cfg.LogLevel),
+		next:     w,
 	}
 
 	// Configure standard logger

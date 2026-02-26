@@ -18,9 +18,8 @@ import (
 // Config holds all runtime configuration values.
 type Config struct {
 	// Logging
-	// LogLevel is parsed from the INI file but currently unused because Go's
-	// standard log package does not support levelled logging. Retained for
-	// forward-compatibility if a levelled logger (e.g. slog) is adopted.
+	// LogLevel controls coarse output filtering (DEBUG/INFO/WARNING/ERROR/CRITICAL).
+	// Untagged messages are treated as INFO by the logger filter.
 	LogLevel       string
 	LogFile        string
 	LogMaxBytes    int
@@ -86,7 +85,7 @@ func DefaultConfig() *Config {
 		MinDynamicFPS:        10,
 		MinDynamicUIFPS:      12,
 		UIFPSStep:            2,
-		CPULoadThreshold:     3.0,
+		CPULoadThreshold:     0.75,
 		CPUTempThresholdC:    75.0,
 		StressHoldCount:      3,
 		RecoverHoldCount:     3,
@@ -325,7 +324,7 @@ func applyINI(cfg *Config, ini iniData) {
 			cfg.UIFPSStep = asInt(v, cfg.UIFPSStep, intPtr(1), nil)
 		}
 		if v, ok := ini.get("performance", "cpu_load_threshold"); ok {
-			cfg.CPULoadThreshold = asFloat(v, cfg.CPULoadThreshold, floatPtr(0.1), floatPtr(20.0))
+			cfg.CPULoadThreshold = asFloat(v, cfg.CPULoadThreshold, floatPtr(0.1), floatPtr(1.0))
 		}
 		if v, ok := ini.get("performance", "cpu_temp_threshold_c"); ok {
 			cfg.CPUTempThresholdC = asFloat(v, cfg.CPUTempThresholdC, floatPtr(30.0), floatPtr(100.0))
@@ -400,45 +399,14 @@ func applyINI(cfg *Config, ini iniData) {
 // Profile scaling (choose_profile equivalent)
 // =============================================================================
 
-// ChooseProfile picks capture resolution and FPS based on camera count.
-// Dynamically scales resolution down when more cameras are active
-// to maintain smooth performance on resource-constrained devices.
+// ChooseProfile returns capture resolution and FPS from config as-is.
+// Python parity: scaling is handled at runtime by dynamic FPS adaptation,
+// not by pre-scaling startup profile values based on camera count.
 //
 // Returns (width, height, captureFPS, uiFPS).
 func (c *Config) ChooseProfile(cameraCount int) (int, int, int, int) {
-	baseW := c.CaptureWidth
-	baseH := c.CaptureHeight
-	baseFPS := c.CaptureFPS
-	baseUIFPS := c.UIFPS
-
-	var scale, fpsScale float64
-
-	switch {
-	case cameraCount >= 6:
-		// 6+ cameras: drop to 50% res, 60% fps
-		scale = 0.5
-		fpsScale = 0.6
-	case cameraCount >= 4:
-		// 4-5 cameras: drop to 75% res, 75% fps
-		scale = 0.75
-		fpsScale = 0.75
-	case cameraCount >= 2:
-		// 2-3 cameras: full res, 90% fps
-		scale = 1.0
-		fpsScale = 0.9
-	default:
-		// 1 camera: full everything
-		scale = 1.0
-		fpsScale = 1.0
-	}
-
-	// Apply scaling; ensure dimensions are multiples of 16 for codec efficiency
-	scaledW := max16(160, roundDown16(int(float64(baseW)*scale)))
-	scaledH := max16(120, roundDown16(int(float64(baseH)*scale)))
-	scaledFPS := intMax(c.MinDynamicFPS, int(float64(baseFPS)*fpsScale))
-	scaledUIFPS := intMax(c.MinDynamicUIFPS, int(float64(baseUIFPS)*fpsScale))
-
-	return scaledW, scaledH, scaledFPS, scaledUIFPS
+	_ = cameraCount // Reserved for future profile variants; parity currently ignores count.
+	return c.CaptureWidth, c.CaptureHeight, c.CaptureFPS, c.UIFPS
 }
 
 // roundDown16 rounds n down to the nearest multiple of 16.

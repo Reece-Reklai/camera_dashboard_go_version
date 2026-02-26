@@ -28,6 +28,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.DynamicFPSEnabled != true {
 		t.Errorf("DynamicFPSEnabled = %v, want true", cfg.DynamicFPSEnabled)
 	}
+	if cfg.CPULoadThreshold != 0.75 {
+		t.Errorf("CPULoadThreshold = %f, want 0.75", cfg.CPULoadThreshold)
+	}
 	if cfg.CaptureWidth != 640 {
 		t.Errorf("CaptureWidth = %d, want 640", cfg.CaptureWidth)
 	}
@@ -438,6 +441,23 @@ slot_count = 20
 	}
 }
 
+func TestLoad_CPULoadThresholdMaxClamp(t *testing.T) {
+	content := `
+[performance]
+cpu_load_threshold = 5.0
+`
+	tmp := writeTempFile(t, content)
+
+	cfg, err := Load(tmp)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.CPULoadThreshold != 1.0 {
+		t.Errorf("CPULoadThreshold = %f, want 1.0 (clamped)", cfg.CPULoadThreshold)
+	}
+}
+
 // =============================================================================
 // ChooseProfile tests
 // =============================================================================
@@ -461,17 +481,15 @@ func TestChooseProfile_TwoCameras(t *testing.T) {
 	cfg := DefaultConfig()
 	w, h, fps, uiFPS := cfg.ChooseProfile(2)
 
-	// 2-3 cameras: full res, 90% fps
+	// Python parity: no pre-scaling by camera count
 	if w != 640 || h != 480 {
 		t.Errorf("2 cameras: resolution = %dx%d, want 640x480", w, h)
 	}
-	// 25 * 0.9 = 22
-	if fps != 22 {
-		t.Errorf("2 cameras: captureFPS = %d, want 22", fps)
+	if fps != 25 {
+		t.Errorf("2 cameras: captureFPS = %d, want 25", fps)
 	}
-	// 20 * 0.9 = 18
-	if uiFPS != 18 {
-		t.Errorf("2 cameras: uiFPS = %d, want 18", uiFPS)
+	if uiFPS != 20 {
+		t.Errorf("2 cameras: uiFPS = %d, want 20", uiFPS)
 	}
 }
 
@@ -479,18 +497,14 @@ func TestChooseProfile_FourCameras(t *testing.T) {
 	cfg := DefaultConfig()
 	w, h, fps, _ := cfg.ChooseProfile(4)
 
-	// 4-5 cameras: 75% res, 75% fps
-	// 640*0.75 = 480 -> roundDown16 = 480
-	// 480*0.75 = 360 -> roundDown16 = 352
-	if w != 480 {
-		t.Errorf("4 cameras: width = %d, want 480", w)
+	if w != 640 {
+		t.Errorf("4 cameras: width = %d, want 640", w)
 	}
-	if h != 352 {
-		t.Errorf("4 cameras: height = %d, want 352", h)
+	if h != 480 {
+		t.Errorf("4 cameras: height = %d, want 480", h)
 	}
-	// 25*0.75 = 18
-	if fps != 18 {
-		t.Errorf("4 cameras: captureFPS = %d, want 18", fps)
+	if fps != 25 {
+		t.Errorf("4 cameras: captureFPS = %d, want 25", fps)
 	}
 }
 
@@ -498,49 +512,46 @@ func TestChooseProfile_SixCameras(t *testing.T) {
 	cfg := DefaultConfig()
 	w, h, fps, _ := cfg.ChooseProfile(6)
 
-	// 6+ cameras: 50% res, 60% fps
-	// 640*0.5 = 320 -> roundDown16 = 320
-	// 480*0.5 = 240 -> roundDown16 = 240
-	if w != 320 {
-		t.Errorf("6 cameras: width = %d, want 320", w)
+	if w != 640 {
+		t.Errorf("6 cameras: width = %d, want 640", w)
 	}
-	if h != 240 {
-		t.Errorf("6 cameras: height = %d, want 240", h)
+	if h != 480 {
+		t.Errorf("6 cameras: height = %d, want 480", h)
 	}
-	// 25*0.6 = 15
-	if fps != 15 {
-		t.Errorf("6 cameras: captureFPS = %d, want 15", fps)
+	if fps != 25 {
+		t.Errorf("6 cameras: captureFPS = %d, want 25", fps)
 	}
 }
 
-func TestChooseProfile_DimensionsMultipleOf16(t *testing.T) {
+func TestChooseProfile_NoImplicitRounding(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.CaptureWidth = 500  // not a multiple of 16
-	cfg.CaptureHeight = 300 // not a multiple of 16
+	cfg.CaptureWidth = 500
+	cfg.CaptureHeight = 300
 
 	w, h, _, _ := cfg.ChooseProfile(1)
 
-	if w%16 != 0 {
-		t.Errorf("width %d is not a multiple of 16", w)
+	if w != 500 {
+		t.Errorf("width = %d, want 500", w)
 	}
-	if h%16 != 0 {
-		t.Errorf("height %d is not a multiple of 16", h)
+	if h != 300 {
+		t.Errorf("height = %d, want 300", h)
 	}
 }
 
-func TestChooseProfile_MinimumDimensions(t *testing.T) {
+func TestChooseProfile_NoCameraCountScaling(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.CaptureWidth = 160
-	cfg.CaptureHeight = 120
+	cfg.CaptureWidth = 320
+	cfg.CaptureHeight = 240
+	cfg.CaptureFPS = 17
+	cfg.UIFPS = 13
 
-	w, h, _, _ := cfg.ChooseProfile(6) // 50% scaling
+	w, h, fps, uiFPS := cfg.ChooseProfile(6)
 
-	// Should not go below 160x120
-	if w < 160 {
-		t.Errorf("width %d below minimum 160", w)
+	if w != 320 || h != 240 {
+		t.Errorf("6 cameras: resolution = %dx%d, want 320x240", w, h)
 	}
-	if h < 120 {
-		t.Errorf("height %d below minimum 120", h)
+	if fps != 17 || uiFPS != 13 {
+		t.Errorf("6 cameras: fps/uiFPS = %d/%d, want 17/13", fps, uiFPS)
 	}
 }
 

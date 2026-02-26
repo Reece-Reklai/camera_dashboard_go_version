@@ -21,7 +21,7 @@ LDFLAGS := -s -w \
 BUILD_DIR := build
 RELEASE_DIR := release
 
-.PHONY: all build clean release release-optimized install run run-log stop status package help
+.PHONY: all build clean test test-ci test-gui release release-optimized install run run-log stop status package help
 
 # Default target
 all: build
@@ -56,6 +56,21 @@ debug:
 	CGO_ENABLED=1 go build -o $(APP_NAME)-debug .
 	@echo "Built: $(APP_NAME)-debug"
 	@ls -lh $(APP_NAME)-debug
+
+# Run default test suite (headless-safe for CI/sandbox)
+test:
+	@echo "Running tests (headless CI mode)..."
+	CGO_ENABLED=1 go test -tags ci ./...
+
+# Run headless-compatible test suite for CI/sandbox environments
+test-ci:
+	@echo "Running headless CI tests..."
+	CGO_ENABLED=1 go test -tags ci ./...
+
+# Run full GUI-linked test suite (requires desktop/OpenGL development libraries)
+test-gui:
+	@echo "Running full GUI tests..."
+	CGO_ENABLED=1 go test ./...
 
 # Install to /usr/local/bin (requires sudo)
 install: release-optimized
@@ -147,6 +162,9 @@ help:
 	@echo "  debug          Build with debug symbols"
 	@echo "  run            Build and run (kills existing)"
 	@echo "  run-log        Build and run with logging"
+	@echo "  test           Run headless-safe Go test suite (-tags ci)"
+	@echo "  test-ci        Run headless CI test suite (-tags ci)"
+	@echo "  test-gui       Run full GUI-linked test suite"
 	@echo "  stop           Stop running instance"
 	@echo "  status         Show CPU, memory, temperature"
 	@echo "  clean          Remove build artifacts"

@@ -19,6 +19,22 @@ import (
 // nightModeLUT is a pre-computed lookup table: grayscale value -> boosted value.
 // Equivalent to Python's: np.clip(np.arange(256) * 1.6, 0, 255).astype(np.uint8)
 var nightModeLUT [256]uint8
+var brightnessLUTs = map[int][256]uint8{}
+
+func buildBrightnessLUT(factor float64) [256]uint8 {
+	if factor <= 0 {
+		factor = 1.0
+	}
+	var lut [256]uint8
+	for i := 0; i < 256; i++ {
+		v := float64(i) * factor
+		if v > 255 {
+			v = 255
+		}
+		lut[i] = uint8(v)
+	}
+	return lut
+}
 
 func init() {
 	for i := 0; i < 256; i++ {
@@ -27,6 +43,10 @@ func init() {
 			v = 255
 		}
 		nightModeLUT[i] = uint8(v)
+	}
+
+	for _, pct := range []int{15, 60, 80, 100, 150} {
+		brightnessLUTs[pct] = buildBrightnessLUT(float64(pct) / 100.0)
 	}
 }
 
@@ -161,4 +181,76 @@ func nightModeColor(c color.Color) color.RGBA {
 	gray := uint8((299*uint32(r8) + 587*uint32(g8) + 114*uint32(b8)) / 1000)
 	boosted := nightModeLUT[gray]
 	return color.RGBA{R: boosted, G: 0, B: 0, A: 255}
+}
+
+func brightnessLUTForPercent(percent int) [256]uint8 {
+	if lut, ok := brightnessLUTs[percent]; ok {
+		return lut
+	}
+	return buildBrightnessLUT(float64(percent) / 100.0)
+}
+
+func applyBrightnessPercentReuse(src image.Image, percent int, dst *image.RGBA) *image.RGBA {
+	lut := brightnessLUTForPercent(percent)
+	return applyBrightnessLUTReuse(src, lut, dst)
+}
+
+func applyBrightnessLUTReuse(src image.Image, lut [256]uint8, dst *image.RGBA) *image.RGBA {
+	bounds := src.Bounds()
+	w := bounds.Dx()
+	h := bounds.Dy()
+	neededLen := w * h * 4
+
+	if dst != nil && cap(dst.Pix) >= neededLen {
+		dst.Pix = dst.Pix[:neededLen]
+		dst.Stride = w * 4
+		dst.Rect = image.Rect(0, 0, w, h)
+	} else {
+		dst = image.NewRGBA(image.Rect(0, 0, w, h))
+	}
+
+	if rgba, ok := src.(*image.RGBA); ok {
+		for y := 0; y < h; y++ {
+			srcOff := (y+bounds.Min.Y-rgba.Rect.Min.Y)*rgba.Stride + (bounds.Min.X-rgba.Rect.Min.X)*4
+			dstOff := y * dst.Stride
+			for x := 0; x < w; x++ {
+				dst.Pix[dstOff+0] = lut[rgba.Pix[srcOff+0]]
+				dst.Pix[dstOff+1] = lut[rgba.Pix[srcOff+1]]
+				dst.Pix[dstOff+2] = lut[rgba.Pix[srcOff+2]]
+				dst.Pix[dstOff+3] = 255
+				srcOff += 4
+				dstOff += 4
+			}
+		}
+		return dst
+	}
+
+	if nrgba, ok := src.(*image.NRGBA); ok {
+		for y := 0; y < h; y++ {
+			srcOff := (y+bounds.Min.Y-nrgba.Rect.Min.Y)*nrgba.Stride + (bounds.Min.X-nrgba.Rect.Min.X)*4
+			dstOff := y * dst.Stride
+			for x := 0; x < w; x++ {
+				dst.Pix[dstOff+0] = lut[nrgba.Pix[srcOff+0]]
+				dst.Pix[dstOff+1] = lut[nrgba.Pix[srcOff+1]]
+				dst.Pix[dstOff+2] = lut[nrgba.Pix[srcOff+2]]
+				dst.Pix[dstOff+3] = 255
+				srcOff += 4
+				dstOff += 4
+			}
+		}
+		return dst
+	}
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			r, g, b, _ := src.At(x+bounds.Min.X, y+bounds.Min.Y).RGBA()
+			off := (y*dst.Stride + x*4)
+			dst.Pix[off+0] = lut[uint8(r>>8)]
+			dst.Pix[off+1] = lut[uint8(g>>8)]
+			dst.Pix[off+2] = lut[uint8(b>>8)]
+			dst.Pix[off+3] = 255
+		}
+	}
+
+	return dst
 }

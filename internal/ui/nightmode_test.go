@@ -164,3 +164,48 @@ func TestNightModeColor(t *testing.T) {
 		t.Errorf("nightModeColor(128,128,128) = R=%d, want R=%d, G=0, B=0", result.R, expected)
 	}
 }
+
+func TestBrightnessLUTPresets(t *testing.T) {
+	// 100% should be identity
+	if brightnessLUTs[100][200] != 200 {
+		t.Errorf("brightness 100%% LUT[200] = %d, want 200", brightnessLUTs[100][200])
+	}
+
+	// 150% should boost and clamp
+	if brightnessLUTs[150][100] != 150 {
+		t.Errorf("brightness 150%% LUT[100] = %d, want 150", brightnessLUTs[150][100])
+	}
+	if brightnessLUTs[150][200] != 255 {
+		t.Errorf("brightness 150%% LUT[200] = %d, want 255", brightnessLUTs[150][200])
+	}
+
+	// 15% should darken strongly
+	if brightnessLUTs[15][200] != 30 {
+		t.Errorf("brightness 15%% LUT[200] = %d, want 30", brightnessLUTs[15][200])
+	}
+}
+
+func TestApplyBrightnessPercentReuse(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	src.Set(0, 0, color.RGBA{100, 150, 200, 255})
+	src.Set(1, 0, color.RGBA{255, 0, 10, 255})
+
+	// Brighten
+	dst := applyBrightnessPercentReuse(src, 150, nil)
+	r, g, b, _ := dst.At(0, 0).RGBA()
+	if uint8(r>>8) != 150 || uint8(g>>8) != 225 || uint8(b>>8) != 255 {
+		t.Errorf("150%% pixel0 got (%d,%d,%d), want (150,225,255)",
+			uint8(r>>8), uint8(g>>8), uint8(b>>8))
+	}
+
+	// Darken and reuse buffer
+	dst2 := applyBrightnessPercentReuse(src, 60, dst)
+	if dst2 != dst {
+		t.Error("expected destination buffer reuse")
+	}
+	r, g, b, _ = dst2.At(1, 0).RGBA()
+	if uint8(r>>8) != 153 || uint8(g>>8) != 0 || uint8(b>>8) != 6 {
+		t.Errorf("60%% pixel1 got (%d,%d,%d), want (153,0,6)",
+			uint8(r>>8), uint8(g>>8), uint8(b>>8))
+	}
+}

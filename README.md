@@ -1,15 +1,16 @@
 # Camera Dashboard
 
-Opencode Driven: A high-performance 3-camera setup as a monitoring system for Raspberry Pi. Built with Go and the Fyne GUI framework.
+Opencode Driven: A high-performance multi-camera monitoring system for Raspberry Pi. Built with Go and the Fyne GUI framework.
 
 ## Features
 
-- **Multi-Camera Support** - Up to 3 USB cameras in a dynamic smart grid layout
+- **Multi-Camera Support** - Configurable camera slots (`slot_count`, default 3, max 8) in a dynamic smart grid layout
 - **Real-time Video** - Configurable resolution/FPS (default 640x480 @ 25 FPS), optimized for vehicle monitoring
 - **Touch Interface** - Tap for fullscreen, long-press to swap camera positions
 - **Hot-plug Detection** - Sysfs-based USB parent matching to avoid false positives from multi-function cameras; per-camera restart on disconnect/reconnect (other cameras unaffected)
 - **Adaptive FPS** - Dynamic thermal/load-based FPS scaling with emergency throttle and sweet-spot probing
 - **Night Mode** - LUT-based red-channel night vision filter (toggle via UI)
+- **Brightness Presets** - Settings tile supports 15%, 60%, 80%, 100%, 150% brightness levels
 - **Clean Shutdown** - Capture workers check stop signals before FFmpeg format fallback retries, preventing zombie processes during exit
 - **Low Power** - Optimized for battery-powered operation (~100% CPU for 2 cameras)
 - **Single Binary** - No Python, no runtime dependencies
@@ -61,6 +62,7 @@ make run
 | **Long-press camera** | Enter swap mode |
 | **Tap another slot** | Swap positions |
 | **Restart button** | Reinitialize cameras |
+| **Brightness buttons** | Adjust display brightness (15/60/80/100/150%) |
 | **Exit button** | Clean shutdown |
 
 ## Configuration
@@ -68,21 +70,27 @@ make run
 Edit `config.ini` (or set environment variables) to change settings:
 
 ```ini
-[capture]
-width = 640       # Resolution width (160-1920)
-height = 480      # Resolution height (120-1080)
-fps = 25          # Frames per second (1-60)
+[profile]
+capture_width = 640
+capture_height = 480
+capture_fps = 25
+capture_format = mjpeg
+ui_fps = 20
 
 [performance]
-dynamic_fps_enabled = true
-min_dynamic_fps = 5
+dynamic_fps = true
+cpu_load_threshold = 0.75
+cpu_temp_threshold_c = 75.0
+min_dynamic_fps = 10
+stale_frame_timeout_sec = 1.5
+restart_cooldown_sec = 5.0
 
-[recovery]
-stale_frame_timeout_sec = 10
-restart_cooldown_sec = 30
+[camera]
+slot_count = 3
+kill_device_holders = true
 ```
 
-Set `CAM_DASH_CONFIG` to override config path. Then rebuild: `make build`
+Set `CAMERA_DASHBOARD_CONFIG` to override config path. Then rebuild: `make build`
 
 ## Makefile Targets
 
@@ -129,7 +137,7 @@ make help       # Show all targets
 
 ### Hot-plug Detection
 
-The hotplug scanner polls `/dev/video*` every 2 seconds using sysfs (not `v4l2-ctl`) to avoid conflicts with active FFmpeg captures. Multi-function USB cameras register multiple `/dev/videoX` nodes under the same physical USB device (e.g., a UVC webcam may own video0-video3). To prevent false "new camera" detections, the scanner resolves each candidate's sysfs USB parent path and rejects any device that shares a parent with an already-tracked camera.
+The hotplug scanner polls `/dev/video*` on a config-driven interval (`[camera] rescan_interval_ms`, default `15000`) using sysfs (not `v4l2-ctl`) to avoid conflicts with active FFmpeg captures. Multi-function USB cameras register multiple `/dev/videoX` nodes under the same physical USB device (e.g., a UVC webcam may own video0-video3). To prevent false "new camera" detections, the scanner resolves each candidate's sysfs USB parent path and rejects any device that shares a parent with an already-tracked camera.
 
 ### Capture & Shutdown
 
