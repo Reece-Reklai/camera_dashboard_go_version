@@ -1,4 +1,4 @@
-# Go BlindSpot Monitoring
+# Go Camera Dashboard
 
 Opencode Driven: A high-performance multi-camera blindspot monitoring system for Raspberry Pi. Built with Go and the Fyne GUI framework.
 
